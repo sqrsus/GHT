@@ -35,6 +35,12 @@ public partial class App : Application
         ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown;
         DispatcherUnhandledException += OnUnhandledException;
 
+        // 上次被强杀会导致系统代理残留指向已关闭的端口 → 这里是唯一的自动修复时机
+        if (SystemProxy.Recover())
+        {
+            Log.Info("检测到上次异常退出残留的系统代理，已还原为用户原设置");
+        }
+
         base.OnStartup(e);
 
         _singleInstance.StartListening(() => Dispatcher.BeginInvoke(new Action(BringToFront)));

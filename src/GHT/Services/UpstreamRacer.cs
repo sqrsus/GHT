@@ -9,9 +9,15 @@ public readonly record struct RaceWin(IPAddress Ip, TcpClient Client);
 /// <summary>
 /// TCP 建连竞速：同时向多个候选 IP 发起 connect，第一个成功的即为上游。
 /// 只做握手竞速，不读不写任何业务数据，因此对 TLS 完全透明。
+///
+/// 句柄纪律：落败的连接必须在返回前被确定性回收。旧实现依赖 ContinueWith 猜任务状态，
+/// 在「取消竞速的同时恰好有别的连接完成」这种时序下会漏掉一个已建立的 socket。
 /// </summary>
 public sealed class UpstreamRacer
 {
+    /// <summary>等待落败任务自我清理的上限。取消后它们通常立刻结束。</summary>
+    private static readonly TimeSpan ReapTimeout = TimeSpan.FromSeconds(2);
+
     private readonly LogService _log;
 
     public UpstreamRacer(LogService log)
@@ -72,11 +78,7 @@ public sealed class UpstreamRacer
             if (win is not null)
             {
                 scope.Cancel();
-
-                foreach (var task in pending)
-                {
-                    Discard(task);
-                }
+                await ReapLosersAsync(pending).ConfigureAwait(false);
 
                 _log.Debug($"竞速胜出：{win.Value.Ip}:{port}");
                 return win;
@@ -98,31 +100,41 @@ public sealed class UpstreamRacer
         }
         catch
         {
+            // 失败路径由自己释放；成功的连接交给调用方或 ReapLosersAsync。
             client.Dispose();
             return null;
         }
     }
 
-    /// <summary>竞速结束后，把「迟到的成功连接」也释放掉，避免句柄泄漏。</summary>
-    private static void Discard(Task<RaceWin?> task)
+    /// <summary>
+    /// 回收落败者：取消已发生，先给它们一点时间自然结束，再把「已经成功但迟到的连接」释放掉。
+    /// 未完成的任务不必强拆——它们的 catch 分支会自行 Dispose。
+    /// </summary>
+    private static async Task ReapLosersAsync(IReadOnlyList<Task<RaceWin?>> losers)
     {
-        _ = task.ContinueWith(
-            static completed =>
+        if (losers.Count == 0)
+        {
+            return;
+        }
+
+        var all = Task.WhenAll(losers);
+        await Task.WhenAny(all, Task.Delay(ReapTimeout)).ConfigureAwait(false);
+
+        foreach (var task in losers)
+        {
+            if (task.Status != TaskStatus.RanToCompletion || task.Result is not { } win)
             {
-                if (completed.Status == TaskStatus.RanToCompletion && completed.Result is { } win)
-                {
-                    try
-                    {
-                        win.Client.Dispose();
-                    }
-                    catch
-                    {
-                        // ignore
-                    }
-                }
-            },
-            CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
+                continue;
+            }
+
+            try
+            {
+                win.Client.Dispose();
+            }
+            catch
+            {
+                // ignore
+            }
+        }
     }
 }

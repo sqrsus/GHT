@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    测试工程刻意只编译「纯逻辑」源码（Models + Services 中不依赖 Windows API 的部分），
+    而不是引用 GHT.csproj：
+    1) GHT 是 net8.0-windows + WPF，测试宿主在 Linux/WSL 上无法加载 WindowsDesktop 运行时；
+    2) 链接同一份 .cs 文件（不是复制）既能被 Linux 直接 dotnet test，也不会与主工程产生行为漂移。
+    因此新增纯逻辑文件无需登记；一旦新文件用到 Registry/WinForms，必须同步加入下面的 Exclude。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>12.0</LangVersion>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>GHT.Tests</RootNamespace>
+    <AssemblyName>GHT.Tests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\src\GHT\Models\**\*.cs"
+             Link="Linked\Models\%(RecursiveDir)%(Filename)%(Extension)" />
+    <Compile Include="..\..\src\GHT\Services\**\*.cs"
+             Exclude="..\..\src\GHT\Services\SystemProxy.cs;..\..\src\GHT\Services\SingleInstance.cs;..\..\src\GHT\Services\AutoStart.cs;..\..\src\GHT\Services\TrayIconService.cs"
+             Link="Linked\Services\%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>

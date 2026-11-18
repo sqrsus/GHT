@@ -16,21 +16,40 @@ namespace GHT.Services;
 ///
 /// 选路（见 <see cref="ConnectForHostAsync"/>）：命中白名单 → 加速池解析 + 多 IP 竞速；否则系统 DNS 直连。
 /// 预算只包住「选路」，绝不包住数据转发，否则长下载/长连接会被预算掐断。
+///
+/// 生命周期用信号量 + 状态机串行化：UI 连点、托盘菜单与退出清理可能同时触发启动/停止，
+/// 只靠 <c>IsRunning</c> 判断会出现两个监听器（其中一个无人持有、也无人停止）。
 /// </summary>
 public sealed class ProxyServer : IAsyncDisposable
 {
     private const int MaxHeadBytes = 32 * 1024;
     private const int RelayBufferSize = 32 * 1024;
     private const int TunnelIdleMs = 60_000;
+    private const int ResponseIdleMs = 120_000;
     private const int DirectConnectTimeoutMs = 8_000;
+
+    /// <summary>单块上限。远超正常分块大小，但能挡住「分块长度写成 2GB」这类攻击。</summary>
+    private const int MaxChunkBytes = 64 * 1024 * 1024;
+
+    private const int MaxTrailerBytes = 8 * 1024;
+    private const int MaxChunkLineLength = 8 * 1024;
+
+    private enum LifecycleState
+    {
+        Stopped,
+        Running,
+        Stopping
+    }
 
     private readonly LogService _log;
     private readonly ResolverHub _resolver;
     private readonly UpstreamRacer _racer;
     private readonly ProxyStatistics _statistics = new();
+    private readonly SemaphoreSlim _lifecycle = new(1, 1);
 
     private volatile AppSettings _settings;
     private volatile DomainWildcardList _whitelist;
+    private volatile LifecycleState _state = LifecycleState.Stopped;
 
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
@@ -50,7 +69,7 @@ public sealed class ProxyServer : IAsyncDisposable
 
     public ResolverHub Resolver => _resolver;
 
-    public bool IsRunning => _listener is not null;
+    public bool IsRunning => _state == LifecycleState.Running;
 
     public int Port => _port;
 
@@ -63,69 +82,124 @@ public sealed class ProxyServer : IAsyncDisposable
 
     public void UpdatePool(IReadOnlyList<DnsPoolEntry> pool) => _resolver.UpdatePool(pool);
 
-    public Task StartAsync(int port)
+    // ── 生命周期 ────────────────────────────────────────────────────────
+
+    /// <summary>启动监听。已在运行时为幂等空操作；正在停止时直接拒绝，避免状态被覆盖。</summary>
+    public async Task StartAsync(int port, CancellationToken cancellationToken = default)
     {
-        if (IsRunning)
-        {
-            return Task.CompletedTask;
-        }
-
-        var listener = new TcpListener(IPAddress.Loopback, port);
-        listener.Start();
-
-        _listener = listener;
-        _port = port;
-        _cts = new CancellationTokenSource();
-
-        var token = _cts.Token;
-        _acceptLoop = Task.Run(() => AcceptLoopAsync(listener, token), CancellationToken.None);
-
-        _log.Info($"代理已启动：127.0.0.1:{port}");
-        return Task.CompletedTask;
-    }
-
-    public async Task StopAsync()
-    {
-        var listener = _listener;
-        var cts = _cts;
-        var loop = _acceptLoop;
-
-        _listener = null;
-        _cts = null;
-        _acceptLoop = null;
+        await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
 
         try
         {
-            cts?.Cancel();
-        }
-        catch
-        {
-            // ignore
-        }
+            if (_state == LifecycleState.Running)
+            {
+                return;
+            }
 
-        try
-        {
-            listener?.Stop();
-        }
-        catch
-        {
-            // ignore
-        }
+            if (_state == LifecycleState.Stopping)
+            {
+                throw new InvalidOperationException("代理正在停止，请稍后重试");
+            }
 
-        if (loop is not null)
-        {
+            TcpListener? listener = null;
+
             try
             {
-                await loop.ConfigureAwait(false);
+                listener = new TcpListener(IPAddress.Loopback, port);
+                listener.Start();
+
+                var cts = new CancellationTokenSource();
+                var loop = Task.Run(() => AcceptLoopAsync(listener, cts.Token), CancellationToken.None);
+
+                _listener = listener;
+                _cts = cts;
+                _acceptLoop = loop;
+                _port = port;
+                _state = LifecycleState.Running;
+
+                _log.Info($"代理已启动：127.0.0.1:{port}");
+            }
+            catch
+            {
+                try
+                {
+                    listener?.Stop();
+                }
+                catch
+                {
+                    // ignore
+                }
+
+                _state = LifecycleState.Stopped;
+                throw;
+            }
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
+    }
+
+    /// <summary>停止监听并等待接入循环退出。整个动作持锁，保证与 <see cref="StartAsync"/> 串行。</summary>
+    public async Task StopAsync(CancellationToken cancellationToken = default)
+    {
+        await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            if (_state == LifecycleState.Stopped)
+            {
+                return;
+            }
+
+            _state = LifecycleState.Stopping;
+
+            var listener = _listener;
+            var cts = _cts;
+            var loop = _acceptLoop;
+
+            _listener = null;
+            _cts = null;
+            _acceptLoop = null;
+
+            try
+            {
+                cts?.Cancel();
             }
             catch
             {
                 // ignore
             }
-        }
 
-        cts?.Dispose();
-        _log.Info("代理已停止");
+            try
+            {
+                listener?.Stop();
+            }
+            catch
+            {
+                // ignore
+            }
+
+            if (loop is not null)
+            {
+                try
+                {
+                    await loop.ConfigureAwait(false);
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+
+            cts?.Dispose();
+            _state = LifecycleState.Stopped;
+            _log.Info("代理已停止");
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
     }
 
     public async ValueTask DisposeAsync() => await StopAsync().ConfigureAwait(false);
@@ -197,10 +271,15 @@ public sealed class ProxyServer : IAsyncDisposable
                     return;
                 }
 
-                var head = HttpHead.Parse(headRead.HeadText);
-                if (head is null)
+                HttpHead head;
+
+                try
                 {
-                    await WriteErrorAsync(stream, 400, "Bad Request", "无法解析请求行", token).ConfigureAwait(false);
+                    head = HttpHead.Parse(headRead.HeadText);
+                }
+                catch (ProxyProtocolException ex)
+                {
+                    await WriteErrorAsync(stream, 400, "Bad Request", ex.Message, token).ConfigureAwait(false);
                     return;
                 }
 
@@ -335,6 +414,13 @@ public sealed class ProxyServer : IAsyncDisposable
                     continue;
                 }
 
+                // 同时出现 Transfer-Encoding: chunked 与 Content-Length 时，
+                // 保留 CL 会让上游按长度读，而我们按分块写 —— 帧必然错位，必须以 TE 为准丢掉 CL。
+                if (head.IsChunked && header.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
                 if (header.Key.Equals("Host", StringComparison.OrdinalIgnoreCase))
                 {
                     hasHost = true;
@@ -353,7 +439,7 @@ public sealed class ProxyServer : IAsyncDisposable
 
             await ProxyProtocol.WriteAsciiAsync(upstreamStream, request.ToString(), token).ConfigureAwait(false);
 
-            if (head.HasToken("Transfer-Encoding", "chunked"))
+            if (head.IsChunked)
             {
                 await CopyChunkedAsync(clientInput, upstreamStream, token).ConfigureAwait(false);
             }
@@ -363,7 +449,10 @@ public sealed class ProxyServer : IAsyncDisposable
             }
 
             await upstreamStream.FlushAsync(token).ConfigureAwait(false);
-            await upstreamStream.CopyToAsync(clientStream, RelayBufferSize, token).ConfigureAwait(false);
+
+            // 响应按原始 framing 直接回灌（chunked 保持 chunked），并带空闲超时，
+            // 避免上游无视 Connection: close 时把连接吊死。
+            await PumpAsync(upstreamStream, clientStream, ResponseIdleMs, token).ConfigureAwait(false);
             await clientStream.FlushAsync(token).ConfigureAwait(false);
         }
     }
@@ -415,6 +504,7 @@ public sealed class ProxyServer : IAsyncDisposable
             throw new UpstreamUnavailableException($"{host}:{port} 的全部候选 IP 均连不上");
         }
 
+        _statistics.AddBudgetFallback();
         _log.Debug($"{host}:{port} 首连预算用尽，回落系统 DNS（后台扫描继续）");
         return await ConnectDirectAsync(host, port, token).ConfigureAwait(false);
     }
@@ -455,6 +545,7 @@ public sealed class ProxyServer : IAsyncDisposable
                 if (win is { } winner)
                 {
                     _statistics.AddRace();
+                    _statistics.AddPoolWin();
                     _statistics.SetWinner(host, winner.Ip.ToString());
                     return (winner.Client, false);
                 }
@@ -514,6 +605,7 @@ public sealed class ProxyServer : IAsyncDisposable
         }
 
         client.NoDelay = true;
+        _statistics.AddDirect();
         return client;
     }
 
@@ -575,7 +667,7 @@ public sealed class ProxyServer : IAsyncDisposable
         }
     }
 
-    private static async Task CopyExactlyAsync(Stream source, Stream target, long count, CancellationToken token)
+    internal static async Task CopyExactlyAsync(Stream source, Stream target, long count, CancellationToken token)
     {
         var buffer = new byte[RelayBufferSize];
         var remaining = count;
@@ -595,52 +687,125 @@ public sealed class ProxyServer : IAsyncDisposable
         }
     }
 
-    private static async Task CopyChunkedAsync(Stream source, Stream target, CancellationToken token)
+    /// <summary>
+    /// 逐块转发 chunked 请求体。校验点（缺一不可）：
+    /// 长度行必须是合法十六进制且不超上限、每块数据后必须紧跟 CRLF、末块后必须有结束空行、尾部头长度受限。
+    /// 任何一处不满足都立刻 400，绝不把半个帧写进上游。
+    /// </summary>
+    internal static async Task CopyChunkedAsync(Stream source, Stream target, CancellationToken token)
     {
         while (true)
         {
             var line = await ReadCrlfLineAsync(source, token).ConfigureAwait(false)
                        ?? throw new ProxyProtocolException("分块请求体不完整");
 
+            var size = ParseChunkSize(line);
             await WriteLineAsync(target, line, token).ConfigureAwait(false);
-
-            var sizeText = line;
-            var semicolon = sizeText.IndexOf(';');
-            if (semicolon >= 0)
-            {
-                sizeText = sizeText[..semicolon];
-            }
-
-            if (!int.TryParse(sizeText.Trim(), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var size) || size < 0)
-            {
-                throw new ProxyProtocolException("分块长度非法");
-            }
 
             if (size == 0)
             {
-                // 尾部 header 区，空行结束
-                while (true)
-                {
-                    var trailer = await ReadCrlfLineAsync(source, token).ConfigureAwait(false);
-                    if (trailer is null)
-                    {
-                        return;
-                    }
-
-                    await WriteLineAsync(target, trailer, token).ConfigureAwait(false);
-
-                    if (trailer.Length == 0)
-                    {
-                        return;
-                    }
-                }
+                await CopyTrailersAsync(source, target, token).ConfigureAwait(false);
+                return;
             }
 
-            // 数据 + 尾随 CRLF
-            await CopyExactlyAsync(source, target, size + 2, token).ConfigureAwait(false);
+            await CopyExactlyAsync(source, target, size, token).ConfigureAwait(false);
+            await CopyCrlfAsync(source, target, token).ConfigureAwait(false);
         }
     }
 
+    private static async Task CopyTrailersAsync(Stream source, Stream target, CancellationToken token)
+    {
+        var budget = MaxTrailerBytes;
+
+        while (true)
+        {
+            var trailer = await ReadCrlfLineAsync(source, token).ConfigureAwait(false)
+                          ?? throw new ProxyProtocolException("分块尾部不完整");
+
+            budget -= trailer.Length + 2;
+            if (budget < 0)
+            {
+                throw new ProxyProtocolException("分块尾部过大");
+            }
+
+            await WriteLineAsync(target, trailer, token).ConfigureAwait(false);
+
+            if (trailer.Length == 0)
+            {
+                return;
+            }
+        }
+    }
+
+    private static int ParseChunkSize(string line)
+    {
+        var text = line;
+        var semicolon = text.IndexOf(';');
+        if (semicolon >= 0)
+        {
+            text = text[..semicolon];
+        }
+
+        text = text.Trim();
+
+        if (text.Length is 0 or > 8)
+        {
+            throw new ProxyProtocolException("分块长度非法");
+        }
+
+        foreach (var c in text)
+        {
+            var hex = c is >= '0' and <= '9' or >= 'a' and <= 'f' or >= 'A' and <= 'F';
+            if (!hex)
+            {
+                throw new ProxyProtocolException("分块长度非法");
+            }
+        }
+
+        if (!int.TryParse(text, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var size) || size < 0)
+        {
+            throw new ProxyProtocolException("分块长度非法");
+        }
+
+        if (size > MaxChunkBytes)
+        {
+            throw new ProxyProtocolException("分块过大");
+        }
+
+        return size;
+    }
+
+    /// <summary>读出并校验「数据块之后必须紧跟的 CRLF」，校验通过后原样转发。</summary>
+    private static async Task CopyCrlfAsync(Stream source, Stream target, CancellationToken token)
+    {
+        var pair = new byte[2];
+        await ReadExactAsync(source, pair, token).ConfigureAwait(false);
+
+        if (pair[0] != (byte)'\r' || pair[1] != (byte)'\n')
+        {
+            throw new ProxyProtocolException("分块数据后缺少 CRLF");
+        }
+
+        await target.WriteAsync(pair.AsMemory(0, 2), token).ConfigureAwait(false);
+    }
+
+    private static async Task ReadExactAsync(Stream source, byte[] buffer, CancellationToken token)
+    {
+        var offset = 0;
+
+        while (offset < buffer.Length)
+        {
+            var read = await source.ReadAsync(buffer.AsMemory(offset, buffer.Length - offset), token).ConfigureAwait(false);
+            if (read <= 0)
+            {
+                throw new ProxyProtocolException("请求体意外结束");
+            }
+
+            offset += read;
+        }
+    }
+
+    /// <summary>只接受 CRLF 结尾的行。裸 LF 会让上游把两行当成一行，属于必须拒绝的帧错误。</summary>
     private static async Task<string?> ReadCrlfLineAsync(Stream stream, CancellationToken token)
     {
         var builder = new StringBuilder(16);
@@ -659,12 +824,17 @@ public sealed class ProxyServer : IAsyncDisposable
             if (value == (byte)'\n')
             {
                 var text = builder.ToString();
-                return text.EndsWith("\r", StringComparison.Ordinal) ? text[..^1] : text;
+                if (text.Length == 0 || text[^1] != '\r')
+                {
+                    throw new ProxyProtocolException("分块行必须以 CRLF 结束");
+                }
+
+                return text[..^1];
             }
 
             builder.Append((char)value);
 
-            if (builder.Length > 8192)
+            if (builder.Length > MaxChunkLineLength)
             {
                 throw new ProxyProtocolException("分块行过长");
             }

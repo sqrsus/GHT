@@ -154,7 +154,7 @@
             </Grid.RowDefinitions>
 
             <TextBlock x:Name="StatsText" Grid.Row="0"
-                       Text="请求 0 · 缓存命中 0 · 竞速 0 · 隧道 0 · 失败 0" />
+                       Text="请求 0 · 池胜 0 · 预算回落 0 · 直连 0 · 隧道 0 · 失败 0" />
 
             <Expander Grid.Row="1" Header="日志" IsExpanded="False" Margin="0,6,0,0">
                 <TextBox x:Name="LogBox" Height="110" IsReadOnly="True"

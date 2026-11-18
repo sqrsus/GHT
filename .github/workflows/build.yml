@@ -43,6 +43,9 @@ jobs:
       - name: 编译（Release）
         run: dotnet build GHT.sln -c Release --no-restore
 
+      - name: 运行单元测试
+        run: dotnet test tests/GHT.Tests/GHT.Tests.csproj -c Release --no-build --logger "console;verbosity=normal"
+
       - name: 发布单文件 exe（框架依赖）
         # 注意：EnableCompressionInSingleFile 仅在 self-contained 下可用（NETSDK1176），
         # 因此这里用 --self-contained false 时必须去掉压缩项。

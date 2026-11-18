@@ -38,6 +38,17 @@ internal static class HttpHeadReader
 
             var data = accumulator.GetBuffer();
             var length = (int)accumulator.Length;
+
+            // 先拒绝裸 LF：只认 CRLF，否则 "\n\n" 会被当成普通内容一直读下去，
+            // 最后以「请求头过大」收场，错误信息指向错误的位置。
+            for (var i = Math.Max(0, previous - 1); i < length; i++)
+            {
+                if (data[i] == 10 && (i == 0 || data[i - 1] != 13))
+                {
+                    throw new ProxyProtocolException("请求头必须使用 CRLF 换行");
+                }
+            }
+
             var from = (int)Math.Max(0, previous - 3);
 
             for (var i = from; i + 3 < length; i++)

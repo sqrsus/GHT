@@ -25,6 +25,9 @@ public sealed class ResolverHub
 
     private volatile IReadOnlyList<DnsPoolEntry> _pool = Array.Empty<DnsPoolEntry>();
 
+    /// <summary>加速池版本号。每次换池自增，用来丢弃「换池前发起、换池后才完成」的扫描结果。</summary>
+    private int _generation;
+
     private int _concurrency = 24;
     private int _timeoutMs = 2000;
     private int _minTtl = 60;
@@ -66,6 +69,10 @@ public sealed class ResolverHub
             .ToArray();
 
         _pool = normalized;
+
+        // 先加版本号再清缓存：正在跑的扫描会因为这个不匹配而放弃写回，
+        // 否则淘汰池的结果会通过缓存继续影响到新池。
+        Interlocked.Increment(ref _generation);
         _cache.Clear();
         _log.Info($"加速池已更新：{normalized.Length} 个 DNS");
     }
@@ -111,12 +118,16 @@ public sealed class ResolverHub
         var firstBatch = new TaskCompletionSource<IReadOnlyList<IPAddress>>(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
-        _ = Task.Run(() => SweepAsync(host, firstBatch), CancellationToken.None);
+        var generation = Volatile.Read(ref _generation);
+        _ = Task.Run(() => SweepAsync(host, firstBatch, generation), CancellationToken.None);
 
         return firstBatch.Task;
     }
 
-    private async Task SweepAsync(string host, TaskCompletionSource<IReadOnlyList<IPAddress>> firstBatch)
+    private async Task SweepAsync(
+        string host,
+        TaskCompletionSource<IReadOnlyList<IPAddress>> firstBatch,
+        int generation)
     {
         try
         {
@@ -134,7 +145,9 @@ public sealed class ResolverHub
 
             var window = Math.Max(0, _firstBatchMs);
             var minIps = Math.Max(1, _firstBatchMinIps);
-            var enough = Math.Max(minIps, 8);
+
+            // 硬停阈值：攒够 8 个就不再继续问剩下的 DNS（首连不需要穷举整池）。
+            var enoughToStop = Math.Max(minIps, 8);
             var concurrency = Math.Max(1, _concurrency);
 
             var index = 0;
@@ -145,13 +158,21 @@ public sealed class ResolverHub
 
             while (index < pool.Count)
             {
+                if (generation != Volatile.Read(ref _generation))
+                {
+                    // 池在扫描过程中被替换，本轮结果已无意义
+                    firstBatch.TrySetResult(Array.Empty<IPAddress>());
+                    return;
+                }
+
                 var chunk = new List<DnsPoolEntry>(concurrency);
                 for (var i = 0; i < concurrency && index < pool.Count; i++)
                 {
                     chunk.Add(pool[index++]);
                 }
 
-                await Task.WhenAll(chunk.Select(entry => QueryOneAsync(entry, host, found, seen, guard.Token)))
+                await Task.WhenAll(
+                        chunk.Select(entry => QueryOneAsync(entry, host, found, seen, generation, guard.Token)))
                     .ConfigureAwait(false);
 
                 int count;
@@ -166,7 +187,7 @@ public sealed class ResolverHub
                     firstBatch.TrySetResult(Snapshot(found));
                 }
 
-                if (count >= enough || stopwatch.ElapsedMilliseconds > 15_000)
+                if (count >= enoughToStop || stopwatch.ElapsedMilliseconds > 15_000)
                 {
                     break;
                 }
@@ -186,6 +207,7 @@ public sealed class ResolverHub
         string host,
         List<IPAddress> found,
         HashSet<string> seen,
+        int generation,
         CancellationToken token)
     {
         if (!IPAddress.TryParse(entry.Ip, out var server))
@@ -193,19 +215,49 @@ public sealed class ResolverHub
             return;
         }
 
-        var answer = await UdpDnsClient.QueryAsync(server, host, _timeoutMs, token).ConfigureAwait(false);
-        if (answer is null || answer.Value.Addresses.Count == 0)
+        // A 与 AAAA 同时问：纯 IPv6 环境下只查 A 会得到空答案，候选池直接少一半路子。
+        var answers = await Task.WhenAll(
+                UdpDnsClient.QueryAsync(server, host, _timeoutMs, token),
+                UdpDnsClient.QueryAsync(server, host, _timeoutMs, token, ipv6: true))
+            .ConfigureAwait(false);
+
+        if (generation != Volatile.Read(ref _generation))
         {
             return;
         }
 
-        var result = answer.Value;
-        var ttl = Math.Clamp(result.TtlSeconds, _minTtl, _maxTtl);
-        _cache.Merge(host, result.Addresses, ttl, _preferIpv4);
+        var addresses = new List<IPAddress>(8);
+        var ttl = _maxTtl;
+        var hit = false;
+
+        foreach (var answer in answers)
+        {
+            if (answer is null)
+            {
+                continue;
+            }
+
+            var result = answer.Value;
+            if (result.Addresses.Count == 0)
+            {
+                continue;
+            }
+
+            hit = true;
+            addresses.AddRange(result.Addresses);
+            ttl = Math.Min(ttl, Math.Clamp(result.TtlSeconds, _minTtl, _maxTtl));
+        }
+
+        if (!hit)
+        {
+            return;
+        }
+
+        _cache.Merge(host, addresses, ttl, _preferIpv4);
 
         lock (found)
         {
-            foreach (var address in result.Addresses)
+            foreach (var address in addresses)
             {
                 if (seen.Add(address.ToString()))
                 {

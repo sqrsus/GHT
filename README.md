@@ -57,28 +57,34 @@ GHT 是一个 Windows 桌面小工具：在本机开一个 HTTP 代理，**只�
 1. 到 [Releases](https://github.com/sqrsus/GHT/releases) 下载 `GHT-*-win-x64.zip` 解压，或使用 CI 产物里的 `dist/GHT.exe`。
 2. 双击运行（框架依赖版需要机器上有 [.NET 8 桌面运行时](https://dotnet.microsoft.com/download/dotnet/8.0)）。
 3. 点「扫描并应用」，等扫描完成后确认，再点「启动加速」。
-   - 启动后会自动把系统代理（当前用户）指向 `127.0.0.1:7890`。
-   - 点「停止加速」或退出程序会自动恢复（只关闭指向本机回环的代理，不动你自己配置的代理）。
+   - 启动后会自动把系统代理（当前用户）指向 `127.0.0.1:7890`，并把**你原本的代理设置**快照到 `proxy-backup.json`。
+   - 点「停止加速」或退出程序时按快照还原（没有快照时只关闭指向本机回环的代理，不动你自己配置的代理）。
+   - 若进程被强杀，下次启动会自动检测残留快照并还原，不会让全机一直指向已关闭的端口。
 
 ### 从源码构建
 
 ```powershell
 dotnet restore GHT.sln
 dotnet build   GHT.sln -c Release
+dotnet test    tests/GHT.Tests/GHT.Tests.csproj -c Release --no-build
 
 # 单文件 exe（框架依赖，需 .NET 8 桌面运行时）
 dotnet publish src/GHT/GHT.csproj -c Release -r win-x64 --self-contained false `
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
-  -p:EnableCompressionInSingleFile=true -o dist
+  -p:DebugType=None -p:DebugSymbols=false -o dist
 ```
 
 > `PublishTrimmed` 必须保持关闭：WPF 不支持裁剪。
+> 框架依赖（`--self-contained false`）时也不能开 `EnableCompressionInSingleFile`，SDK 会报 NETSDK1176。
+
+测试工程 `tests/GHT.Tests` 只编译「不依赖 Windows API 的纯逻辑源码」（HTTP 解析、chunked 帧、DNS 报文、白名单、配置归一化），因此可以在 Linux/WSL 上直接 `dotnet test`，不必等到 Windows runner。
 
 ---
 
 ## 四、配置项
 
 配置保存在 `%LOCALAPPDATA%\GHT\settings.json`，改完保存即生效，无需重启程序。
+保存采用「唯一临时文件 → 留一份 `settings.json.bak` → 原子替换」，并加了保存锁；读取失败时会自动回退到 `.bak`。
 若本机存在旧版 `%LOCALAPPDATA%\CloudflareSmartProxy\settings.json`，首次启动会自动复制一份过来（不覆盖已有文件）。
 
 | 字段 | 默认值 | 说明 |
@@ -134,7 +140,10 @@ src/GHT/
     ├── AutoStart.cs           开机自启
     ├── AppPaths.cs            %LOCALAPPDATA%\GHT 路径与旧配置迁移
     ├── DomainWildcardList.cs  通配域名匹配
-    └── LogService.cs          按天分文件日志 + 内存缓冲
+    └── LogService.cs          按天分文件日志 + 大小轮转 + 内存缓冲
+
+tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平台运行）
+└── HttpHead / ChunkedBody / DnsMessage / DomainWildcardList / Settings
 ```
 
 ---
@@ -143,7 +152,7 @@ src/GHT/
 
 | 工作流 | 触发 | 做了什么 |
 |---|---|---|
-| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
+| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（59 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
 | `release.yml` | 推送 `v*` 标签 | 同上构建，打包 zip 并创建 GitHub Release |
 
 发布新版本：
@@ -160,9 +169,12 @@ git push origin v1.0.1
 - **仅 Windows 10/11 x64**：WPF + 注册表 + 托盘，跨平台需重写宿主层。
 - **仅 HTTP/1.1**：不支持 h2，浏览器会对代理自动降级。
 - **明文 HTTP 采用「一次连接一个请求」**：向上游强制 `Connection: close`，换取转发逻辑的绝对可靠；HTTPS 走隧道不受影响。
+- **明文 HTTP 的帧是严格校验的**：只接受 chunked 与定长两种请求体；畸形头、折行头、重复且冲突的 `Content-Length`、非 chunked 结尾的 `Transfer-Encoding`、缺 CRLF 的分块一律回 400，不做「猜着转发」。
 - **端口 80/443 才走加速**：其他端口一律直连。
-- **强杀进程会残留系统代理**：请用「停止加速」或正常退出（程序退出时会尝试清理一次）。
+- **强杀进程后系统代理会残留，但下次启动会自动修复**：接管前会把用户原有的 `ProxyEnable` / `ProxyServer` / `ProxyOverride` 快照到 `%LOCALAPPDATA%\GHT\proxy-backup.json`；正常退出按快照还原，下次启动若发现遗留快照且代理仍指向自己则自动还原。若之后不再启动本程序，需要手工关闭系统代理。
 - **首次启动需要先「扫描并应用」**：加速池为空时所有请求都会走系统 DNS（功能正常，但没有加速效果）。
+- **DNS 同时查询 A 与 AAAA**：纯 IPv4 环境下 AAAA 查询会空跑（两次往返并发发出，超时与 A 相同，不额外拖慢首连）。
+- **日志默认不落 DEBUG**：DEBUG 只进内存（UI 可见）；排查时设 `GHT_LOG_DEBUG=1` 再启动。日志按 4MB 分卷、保留 14 天。
 
 ---
 

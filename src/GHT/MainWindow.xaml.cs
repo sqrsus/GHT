@@ -212,7 +212,8 @@ public partial class MainWindow : Window
     {
         _settings.GlobalDnsWhitelist = WhitelistBox.Text ?? string.Empty;
         _settings.DnsAccelEnabled = AccelCheck.IsChecked == true;
-        SettingsStore.Save(_settings, _log);
+
+        var saved = SettingsStore.Save(_settings, _log);
         _proxy?.UpdateSettings(_settings);
 
         var parsed = DomainWildcardList.Parse(_settings.GlobalDnsWhitelist);
@@ -224,6 +225,12 @@ public partial class MainWindow : Window
 
         if (showFeedback)
         {
+            if (!saved)
+            {
+                ShowWarning("配置保存失败：请检查磁盘空间或目录权限，详细原因见日志。");
+                return;
+            }
+
             ShowInfo(parsed.IsEmpty
                 ? "已保存。白名单为空，全部域名将直接使用系统 DNS。"
                 : $"已保存并生效，共 {parsed.Entries.Count} 条规则。");
@@ -570,14 +577,15 @@ public partial class MainWindow : Window
 
         if (snapshot is not { } stats)
         {
-            StatsText.Text = "请求 0 · 缓存命中 0 · 竞速 0 · 隧道 0 · 失败 0";
+            StatsText.Text = "请求 0 · 池胜 0 · 预算回落 0 · 直连 0 · 隧道 0 · 失败 0";
             return;
         }
 
         var cacheHits = _proxy?.Resolver.CacheHits ?? 0;
 
         StatsText.Text =
-            $"请求 {stats.Requests} · 缓存命中 {cacheHits} · 竞速 {stats.Races} · 隧道 {stats.Tunnels} · 失败 {stats.Errors}" +
+            $"请求 {stats.Requests} · 池胜 {stats.PoolWins} · 预算回落 {stats.BudgetFallbacks} · 直连 {stats.DirectConnects}" +
+            $" · 缓存命中 {cacheHits} · 隧道 {stats.Tunnels} · 失败 {stats.Errors}" +
             (string.IsNullOrEmpty(stats.LastWinner) ? string.Empty : $"　|　最近胜出：{stats.LastWinner}");
     }
 
