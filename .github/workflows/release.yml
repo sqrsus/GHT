@@ -59,7 +59,55 @@ jobs:
 
       # 发布前必须绿：release 分支的产物不允许跳过测试
       - name: 运行单元与集成测试
-        run: dotnet test tests/GHT.Tests/GHT.Tests.csproj -c Release --no-build --logger "console;verbosity=normal"
+        shell: pwsh
+        run: |
+          dotnet test tests/GHT.Tests/GHT.Tests.csproj -c Release --no-build `
+            --logger "console;verbosity=normal" `
+            --logger "trx;LogFileName=tests.trx" `
+            --results-directory TestResults
+
+          $code = $LASTEXITCODE
+          if ($code -eq 0) { exit 0 }
+
+          # 失败时把失败的用例名与断言首行写成 annotation（日志需要仓库权限才能下载）
+          $trx = Get-ChildItem TestResults -Filter *.trx -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (-not $trx) {
+            Write-Host '::error::测试失败且没有产出 TRX，请查看完整日志'
+            exit $code
+          }
+
+          [xml]$doc = Get-Content $trx.FullName -Raw
+          $failed = @($doc.TestRun.Results.UnitTestResult | Where-Object { $_.outcome -ne 'Passed' })
+
+          if ($failed.Count -eq 0) {
+            Write-Host '::error::测试失败但 TRX 里没有失败用例（可能是测试宿主崩溃）'
+            exit $code
+          }
+
+          foreach ($item in $failed) {
+            $message = ''
+            try {
+              $message = @($item.Output.ErrorInfo.Message -split "`r?`n" | Where-Object { $_.Trim() })[0]
+            }
+            catch {
+              # 没有 ErrorInfo 时用例名本身已足够定位
+            }
+
+            Write-Host "::error title=失败用例::$($item.testName) | $message"
+          }
+
+          exit $code
+
+      - name: 保留测试结果
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: 发布单文件 exe（框架依赖）
         # 注意：EnableCompressionInSingleFile 仅在 self-contained 下可用（NETSDK1176），
