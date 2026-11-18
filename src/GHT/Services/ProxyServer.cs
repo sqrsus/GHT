@@ -407,9 +407,18 @@ public sealed class ProxyServer : IAsyncDisposable
 
             var hasHost = false;
 
+            // 客户端带 Expect: 100-continue 时会停在这里等我们点头再发请求体。
+            // 代理不跟上游协商，直接自己应答并丢掉这个头，否则双方互等（curl 上传大文件必踩）。
+            var expectContinue = head.HasToken("Expect", "100-continue");
+
             foreach (var header in head.Headers)
             {
                 if (ProxyProtocol.IsHopByHopHeader(header.Key))
+                {
+                    continue;
+                }
+
+                if (expectContinue && header.Key.Equals("Expect", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
@@ -438,6 +447,12 @@ public sealed class ProxyServer : IAsyncDisposable
             request.Append("Connection: close\r\n\r\n");
 
             await ProxyProtocol.WriteAsciiAsync(upstreamStream, request.ToString(), token).ConfigureAwait(false);
+
+            if (expectContinue)
+            {
+                await clientStream.WriteAsync(ProxyProtocol.ContinueResponse, token).ConfigureAwait(false);
+                await clientStream.FlushAsync(token).ConfigureAwait(false);
+            }
 
             if (head.IsChunked)
             {

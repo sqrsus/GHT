@@ -24,6 +24,9 @@ public static class ProxyProtocol
     public static readonly byte[] ConnectEstablished =
         Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\nProxy-Agent: GHT/1.0\r\n\r\n");
 
+    /// <summary>对 <c>Expect: 100-continue</c> 的应答：客户端见到它才会开始发请求体。</summary>
+    public static readonly byte[] ContinueResponse = Encoding.ASCII.GetBytes("HTTP/1.1 100 Continue\r\n\r\n");
+
     /// <summary>逐跳头：只对当前这一跳有意义，转发时必须剔除，否则会污染下游连接语义。</summary>
     public static bool IsHopByHopHeader(string name) =>
         name.Equals("Connection", StringComparison.OrdinalIgnoreCase)
