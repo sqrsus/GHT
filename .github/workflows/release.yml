@@ -28,6 +28,8 @@ jobs:
           dotnet-version: 8.0.x
 
       - name: 发布单文件 exe（框架依赖）
+        # 注意：EnableCompressionInSingleFile 仅在 self-contained 下可用（NETSDK1176），
+        # 因此这里用 --self-contained false 时必须去掉压缩项。
         run: >
           dotnet publish src/GHT/GHT.csproj
           -c Release
@@ -35,7 +37,6 @@ jobs:
           --self-contained false
           -p:PublishSingleFile=true
           -p:IncludeNativeLibrariesForSelfExtract=true
-          -p:EnableCompressionInSingleFile=true
           -p:DebugType=None
           -p:DebugSymbols=false
           -o dist

@@ -7,6 +7,7 @@ using System.Windows.Media;
 using System.Windows.Threading;
 using GHT.Models;
 using GHT.Services;
+using GHT.Services.Dns;
 
 namespace GHT;
 
@@ -70,6 +71,49 @@ public partial class MainWindow : Window
         _statsTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _statsTimer.Tick += OnStatsTick;
         _statsTimer.Start();
+    }
+
+    /// <summary>
+    /// 把配置灌进界面。全程用 _loading 屏蔽控件事件，
+    /// 否则 IsChecked / SelectedIndex 的赋值会触发保存，把还没读出来的字段覆盖成默认值。
+    /// </summary>
+    private void LoadSettingsToUi()
+    {
+        _loading = true;
+
+        try
+        {
+            PortBox.Text = _settings.ProxyPort.ToString(CultureInfo.InvariantCulture);
+            WhitelistBox.Text = _settings.GlobalDnsWhitelist;
+            AccelCheck.IsChecked = _settings.DnsAccelEnabled;
+
+            ScanDomainBox.Text = string.IsNullOrWhiteSpace(_settings.DnsLastScanDomain)
+                ? _settings.DnsPoolDomain
+                : _settings.DnsLastScanDomain;
+
+            RaceMaxIpsBox.Text = _settings.RaceMaxIps.ToString(CultureInfo.InvariantCulture);
+            BudgetBox.Text = _settings.ConnectBudgetMs.ToString(CultureInfo.InvariantCulture);
+            RaceTimeoutBox.Text = _settings.RaceConnectTimeoutMs.ToString(CultureInfo.InvariantCulture);
+            RetryRoundsBox.Text = _settings.RaceRetryRounds.ToString(CultureInfo.InvariantCulture);
+            ScanConcurrencyBox.Text = _settings.DnsScanConcurrency.ToString(CultureInfo.InvariantCulture);
+            ScanTimeoutBox.Text = _settings.DnsScanTimeoutMs.ToString(CultureInfo.InvariantCulture);
+
+            // 自启状态以注册表为准：可能被组策略或用户手工改过，配置里的值不一定可信。
+            var autoStart = AutoStart.Get();
+            _settings.AutoStart = autoStart;
+            AutoStartCheck.IsChecked = autoStart;
+
+            CloseActionBox.ItemsSource = CloseActionValues;
+            CloseActionBox.SelectedIndex = Array.IndexOf(CloseActionValues, _settings.CloseActionOrDefault);
+        }
+        finally
+        {
+            _loading = false;
+        }
+
+        FillPool();
+        RefreshStats();
+        UpdateRunningUi(running: false);
     }
 
     // ── 启动/停止 ───────────────────────────────────────────────────────

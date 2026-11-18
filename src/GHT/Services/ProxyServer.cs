@@ -197,14 +197,14 @@ public sealed class ProxyServer : IAsyncDisposable
                     return;
                 }
 
-                var head = HttpHead.Parse(headRead.Value.HeadText);
+                var head = HttpHead.Parse(headRead.HeadText);
                 if (head is null)
                 {
                     await WriteErrorAsync(stream, 400, "Bad Request", "无法解析请求行", token).ConfigureAwait(false);
                     return;
                 }
 
-                var body = new BufferedReadStream(stream, headRead.Value.Leftover);
+                var body = new BufferedReadStream(stream, headRead.Leftover);
 
                 if (string.Equals(head.Method, "CONNECT", StringComparison.OrdinalIgnoreCase))
                 {
