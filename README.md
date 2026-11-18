@@ -12,7 +12,7 @@ GHT 是一个 Windows 桌面小工具：在本机开一个 HTTP 代理，**只�
 | 不做 | 说明 |
 |---|---|
 | 不解密 TLS | `CONNECT` 之后是纯 TCP 隧道，字节原样转发，不安装任何根证书，不需要管理员权限 |
-| 不做 CDN 网段优选 | 不拉取 Cloudflare / CloudFront 网段做测速，避免与 DNS 加速链路重复 |
+| 不做 CDN 网段测速 | 不拉取 Cloudflare / CloudFront 网段逐个测速；只把 GitHub 官方 `api.github.com/meta` 公布的边缘地址当作**候选补充**（不改变链路，见第二节） |
 | 不做逐请求选路 | 同一条 HTTPS 连接内的所有请求共享一个上游 IP（隧道端到端，看不到内层请求） |
 | 不做流量中转 | 没有任何远程服务器，全部逻辑都在本机完成 |
 | 不提供加密或规避能力 | 只做解析与链路选择，请遵守你所在地区的法律法规与目标站点的使用条款 |
@@ -33,6 +33,11 @@ GHT 是一个 Windows 桌面小工具：在本机开一个 HTTP 代理，**只�
          ▼
 ┌──────────────────┐   用加速池里的 N 台公共 DNS 并发解析该域名
 │  ResolverHub     │──────────► 拿到一批候选 IP（IPv4 优先，带 TTL 缓存）
+└────────┬─────────┘
+         │ 另有 GithubMetaProvider 提供 GitHub 官方地址种子（按主机绑定，从上百个里按健康度取几个）
+         ▼
+┌──────────────────┐   TLS 闸门：SNI + 证书链旁路探测，剔除「TCP 通但 TLS 失败」的地址
+│ UpstreamValidator│──────────► trusted 优先 / unverified 照常竞速 / known-bad 剔除
 └────────┬─────────┘
          ▼
 ┌──────────────────┐   同时向多个 IP 发起 TCP connect，第一个成功的胜出
@@ -65,6 +70,19 @@ GHT 是一个 Windows 桌面小工具：在本机开一个 HTTP 代理，**只�
 | 统计 UI | 窗口隐藏时停表 | 托盘运行期间不需要每秒拼字符串 |
 
 隧道转发保留**半关闭**语义：一侧正常 EOF 时只 `Shutdown(Send)`，另一方向继续；**空闲超时不发 FIN**，否则「长时间只收不发」的大文件下载会被提前掐断。
+
+### GitHub 官方地址（meta）与 TLS 校验闸门
+
+除了「问公共 DNS」，候选还有第二个来源：GitHub 在 `api.github.com/meta` 公布的边缘地址。它治的是 DNS 治不了的两种病——**答案被污染**、**GeoDNS 把你分到远端区域**（实测同一份列表里既有 `japaneast` 也有 `eastus` / `southafricanorth`，握手差 2 倍以上）。
+
+四条约束是这个功能的全部边界：
+
+1. **只取 `web` / `git` / `api` / `pages`，并按主机严格绑定。** `hooks` / `importer` / `actions` 是「GitHub 连你」的地址，拿来当出口只会拉长竞速；`pages` 的地址服务 `github.com` 会返回 404，所以只给 `*.github.io`。`githubusercontent.com` / `githubassets.com` / `ghcr.io` 在 meta 里没有分组，**不猜、不给静态候选**，继续依赖 DNS 池。
+2. **竞速之前必须过 TLS 校验闸门。** 竞速只证明 SYN/ACK 回来了。实测 4 个随机官方地址里有 2 个「TCP 能通但 TLS 失败」，只按建连速度选路会稳定地选到它们。闸门用 `SNI = 目标主机 + 证书链` 旁路探测（仅 443），结论缓存 10 分钟；**冷启动不阻塞**，首个请求仍是原来的行为，探测在后台跑，之后才「可信优先」。
+3. **候选池不截断，截断交给健康度。** `github.com` 的官方池实测 146 个地址，每次只注入 `GithubMetaSeedCount`（默认 4）个，由 `UpstreamRacer.RankSeeds` 按「近期失败靠后 → 已验证可用优先 → 未知按当日轮换序」挑选。这样试出来的好地址会稳定留在窗口里，轮换只作用于没试过的地址。
+4. **地址从网络来，不硬编码。** 启动先读 `%LOCALAPPDATA%\GHT\github-meta.json`（同步，几毫秒），再按需后台刷新（12 小时周期，失败保留旧快照，超过 7 天的缓存直接弃用）。绝不写进 hosts。
+
+收益要诚实：它省的是**选路与握手**（实测同一时刻 `southeastasia` 0.63s vs `japaneast` 0.40s，整页 0.83s → 0.40s 量级），**不改变跨境带宽与丢包**，也不覆盖 release 资产与 LFS。
 
 ---
 
@@ -119,6 +137,9 @@ dotnet publish src/GHT/GHT.csproj -c Release -r win-x64 --self-contained false `
 | `RaceBatchBudgetMs` | `6000` | 单批竞速总预算 |
 | `RaceRetryRounds` | `2` | 全批失败后的重赛轮数 |
 | `RaceRetryDelayMs` | `800` | 重赛前等待（给后台扫描补候选的机会） |
+| `GithubMetaEnabled` | `true` | 是否把 `api.github.com/meta` 的官方边缘地址作为静态候选注入竞速 |
+| `GithubMetaSeedCount` | `4` | 每次选路最多注入几个官方地址（`0` = 关闭；上限 32） |
+| `ValidateCandidates` | `true` | 443 端口竞速前是否用 SNI + 证书链校验候选；关掉后退化成「TCP 通就选」 |
 | `DnsScanConcurrency` | `128` | 扫描公共 DNS 的并发数 |
 | `DnsScanTimeoutMs` | `2000` | 单次 DNS 查询超时 |
 | `DnsCacheMinTtlSec` / `DnsCacheMaxTtlSec` | `60` / `600` | 解析结果缓存 TTL 区间（逐地址计时） |
@@ -152,8 +173,10 @@ src/GHT/
 └── Services/
     ├── ProxyServer.cs         接入、选路编排、隧道与明文转发
     ├── ProxyProtocol.cs       HTTP 常量、逐跳头规则、错误响应
-    ├── UpstreamRacer.cs       TCP 建连竞速 + 地址健康度
+    ├── UpstreamRacer.cs       TCP 建连竞速 + 地址健康度 + 种子排序
+    ├── UpstreamValidator.cs   TLS 校验闸门（SNI + 证书链，正负缓存）
     ├── ResolverHub.cs         域名 → 候选 IP（预算语义、后台扫描、渐进缓存、DNS 健康度）
+    ├── Github/                api.github.com/meta 拉取、按主机分组、CIDR 采样、磁盘缓存
     ├── Diagnostics/           域名诊断（复用 DNS 扫描与竞速，产出可复制报告）
     ├── Http/                  请求头解析、前置缓冲流、带缓冲的行读取流
     ├── Dns/                   DNS 报文编解码、UDP 客户端、扫描器、结果缓存、内置清单
@@ -169,6 +192,7 @@ src/GHT/
 tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平台运行）
 └── HttpHead / ChunkedBody / DnsMessage / DnsResultCache / ResolverHub
     / ProxyStatistics / LogService / DomainWildcardList / Settings
+    / GithubMeta / UpstreamValidator / UpstreamRacer
 ```
 
 ---
@@ -177,14 +201,14 @@ tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平�
 
 | 工作流 | 触发 | 做了什么 |
 |---|---|---|
-| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（89 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
+| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（118 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
 | `release.yml` | 推送 `v*` 标签 | 同上构建，打包 zip 并创建 GitHub Release |
 
 发布新版本：
 
 ```bash
-git tag v1.2.0
-git push origin v1.2.0
+git tag v1.3.0
+git push origin v1.3.0
 ```
 
 ---
@@ -203,6 +227,9 @@ git push origin v1.2.0
 - **DNS 同时查询 A 与 AAAA**：纯 IPv4 环境下 AAAA 查询会空跑（两次往返并发发出，超时与 A 相同，不额外拖慢首连）。
 - **日志默认不落 DEBUG**：DEBUG 只进内存（UI 可见）；排查时设 `GHT_LOG_DEBUG=1` 再启动。日志按 4MB 分卷、保留 14 天，写入是异步的（进程被强杀时最多丢队列里最后几批）。
 - **诊断结果是快照**：它反映点击那一刻的解析与建连情况，不代表运行期代理的逐请求行为。
+- **官方地址只覆盖部分主机**：meta 不含 `githubusercontent.com`、release 资产（`objects.githubusercontent.com`）与 LFS，这些主机仍然只靠 DNS 池。同理，它省的是握手与选路，**大文件下载速度不会因此变快**。
+- **TLS 闸门是旁路探测**：`CONNECT` 隧道对代理透明，不能对「即将交给客户端的那条连接」做 TLS。因此闸门通过独立探测给候选打分，而非在胜出连接上验证；探测结论按 `(主机, IP)` 缓存 10 分钟，`ValidateCandidates=false` 可整体关闭。
+- **首次启动没有官方地址**：缓存文件不存在时会立刻在后台拉一次；离线或 `api.github.com` 不可达时该功能自动退化为「仅 DNS 池」，不影响其他逻辑。
 
 ---
 

@@ -75,9 +75,14 @@ public partial class MainWindow : Window
         AutoStartCheck.Unchecked += OnAutoStartChanged;
         FallbackCheck.Checked += OnFallbackChanged;
         FallbackCheck.Unchecked += OnFallbackChanged;
+        GithubMetaCheck.Checked += OnMetaChanged;
+        GithubMetaCheck.Unchecked += OnMetaChanged;
+        ValidateCheck.Checked += OnValidateChanged;
+        ValidateCheck.Unchecked += OnValidateChanged;
+        RefreshMetaButton.Click += OnRefreshMetaClick;
         CloseActionBox.SelectionChanged += OnCloseActionChanged;
 
-        foreach (var box in new[] { RaceMaxIpsBox, BudgetBox, RaceTimeoutBox, RetryRoundsBox, ScanConcurrencyBox, ScanTimeoutBox })
+        foreach (var box in new[] { RaceMaxIpsBox, BudgetBox, RaceTimeoutBox, RetryRoundsBox, ScanConcurrencyBox, ScanTimeoutBox, MetaSeedBox })
         {
             box.LostFocus += OnTuningLostFocus;
         }
@@ -133,6 +138,9 @@ public partial class MainWindow : Window
             ScanConcurrencyBox.Text = _settings.DnsScanConcurrency.ToString(CultureInfo.InvariantCulture);
             ScanTimeoutBox.Text = _settings.DnsScanTimeoutMs.ToString(CultureInfo.InvariantCulture);
             FallbackCheck.IsChecked = _settings.FallbackOnCandidatesFailed;
+            GithubMetaCheck.IsChecked = _settings.GithubMetaEnabled;
+            MetaSeedBox.Text = _settings.GithubMetaSeedCount.ToString(CultureInfo.InvariantCulture);
+            ValidateCheck.IsChecked = _settings.ValidateCandidates;
 
             // 自启状态以注册表为准：可能被组策略或用户手工改过，配置里的值不一定可信。
             var autoStart = AutoStart.Get();
@@ -184,7 +192,7 @@ public partial class MainWindow : Window
             {
                 var running = _proxy;
                 _proxy = null;
-                await running.StopAsync().ConfigureAwait(true);
+                await running.DisposeAsync().ConfigureAwait(true);
                 SystemProxy.Clear();
                 _lastSnapshot = null;
                 UpdateRunningUi(false);
@@ -574,6 +582,7 @@ public partial class MainWindow : Window
         _settings.RaceRetryRounds = ParseInt(RetryRoundsBox, _settings.RaceRetryRounds);
         _settings.DnsScanConcurrency = ParseInt(ScanConcurrencyBox, _settings.DnsScanConcurrency);
         _settings.DnsScanTimeoutMs = ParseInt(ScanTimeoutBox, _settings.DnsScanTimeoutMs);
+        _settings.GithubMetaSeedCount = ParseInt(MetaSeedBox, _settings.GithubMetaSeedCount);
 
         SettingsStore.Normalize(_settings);
 
@@ -602,6 +611,9 @@ public partial class MainWindow : Window
         _settings.RaceBatchBudgetMs = defaults.RaceBatchBudgetMs;
         _settings.PreferIpv4 = defaults.PreferIpv4;
         _settings.FallbackOnCandidatesFailed = defaults.FallbackOnCandidatesFailed;
+        _settings.GithubMetaEnabled = defaults.GithubMetaEnabled;
+        _settings.GithubMetaSeedCount = defaults.GithubMetaSeedCount;
+        _settings.ValidateCandidates = defaults.ValidateCandidates;
 
         SettingsStore.Normalize(_settings);
         RefreshTuningBoxes();
@@ -619,6 +631,9 @@ public partial class MainWindow : Window
         ScanConcurrencyBox.Text = _settings.DnsScanConcurrency.ToString(CultureInfo.InvariantCulture);
         ScanTimeoutBox.Text = _settings.DnsScanTimeoutMs.ToString(CultureInfo.InvariantCulture);
         FallbackCheck.IsChecked = _settings.FallbackOnCandidatesFailed;
+        GithubMetaCheck.IsChecked = _settings.GithubMetaEnabled;
+        MetaSeedBox.Text = _settings.GithubMetaSeedCount.ToString(CultureInfo.InvariantCulture);
+        ValidateCheck.IsChecked = _settings.ValidateCandidates;
     }
 
     private void OnFallbackChanged(object sender, RoutedEventArgs e)
@@ -631,6 +646,73 @@ public partial class MainWindow : Window
         _settings.FallbackOnCandidatesFailed = FallbackCheck.IsChecked == true;
         SettingsStore.Save(_settings, _log);
         _proxy?.UpdateSettings(_settings);
+    }
+
+    private void OnMetaChanged(object sender, RoutedEventArgs e)
+    {
+        if (_loading)
+        {
+            return;
+        }
+
+        _settings.GithubMetaEnabled = GithubMetaCheck.IsChecked == true;
+        SettingsStore.Save(_settings, _log);
+        _proxy?.UpdateSettings(_settings);
+
+        if (_settings.GithubMetaEnabled)
+        {
+            _ = RefreshMetaAsync(interactive: false);
+        }
+    }
+
+    private void OnValidateChanged(object sender, RoutedEventArgs e)
+    {
+        if (_loading)
+        {
+            return;
+        }
+
+        _settings.ValidateCandidates = ValidateCheck.IsChecked == true;
+        SettingsStore.Save(_settings, _log);
+        _proxy?.UpdateSettings(_settings);
+    }
+
+    private async void OnRefreshMetaClick(object sender, RoutedEventArgs e) => await RefreshMetaAsync(interactive: true);
+
+    /// <summary>
+    /// 拉取官方地址。注意它挂在「代理实例」上：没有启动过加速就没有提供器，
+    /// 此时不做无意义的拉取，直接提示用户先启动。
+    /// </summary>
+    private async Task RefreshMetaAsync(bool interactive)
+    {
+        if (_proxy is null)
+        {
+            if (interactive)
+            {
+                ShowInfo("请先启动加速：官方地址在代理启动后加载。");
+            }
+
+            return;
+        }
+
+        RefreshMetaButton.IsEnabled = false;
+
+        try
+        {
+            var ok = await _proxy.GithubMeta.RefreshAsync(CancellationToken.None).ConfigureAwait(true);
+            MetaStateText.Text = _proxy.GithubMeta.Describe();
+
+            if (interactive)
+            {
+                ShowInfo(ok
+                    ? "官方地址已刷新。"
+                    : "刷新失败，已沿用上一份快照（原因见日志）。");
+            }
+        }
+        finally
+        {
+            RefreshMetaButton.IsEnabled = true;
+        }
     }
 
     private static int ParseInt(TextBox box, int fallback) =>
@@ -743,7 +825,7 @@ public partial class MainWindow : Window
         {
             try
             {
-                _proxy.StopAsync().GetAwaiter().GetResult();
+                _proxy.DisposeAsync().AsTask().GetAwaiter().GetResult();
             }
             catch
             {
@@ -869,6 +951,10 @@ public partial class MainWindow : Window
         }
 
         StatsText.Text = text;
+
+        MetaStateText.Text = _proxy is null
+            ? "官方地址：启动后加载"
+            : _proxy.GithubMeta.Describe();
 
         RefreshPoolHealth();
         UpdateTraySpeed(upRate, downRate);

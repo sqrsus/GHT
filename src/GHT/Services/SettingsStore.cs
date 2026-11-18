@@ -110,6 +110,7 @@ public static class SettingsStore
         settings.RaceBatchBudgetMs = Clamp(settings.RaceBatchBudgetMs, 200, 120_000, 6000);
         settings.RaceRetryRounds = Clamp(settings.RaceRetryRounds, 0, 5, 2);
         settings.RaceRetryDelayMs = Clamp(settings.RaceRetryDelayMs, 100, 60_000, 800);
+        settings.GithubMetaSeedCount = Clamp(settings.GithubMetaSeedCount, 0, 32, 4);
         settings.DnsScanConcurrency = Clamp(settings.DnsScanConcurrency, 1, 1024, 128);
         settings.DnsScanTimeoutMs = Clamp(settings.DnsScanTimeoutMs, 200, 20_000, 2000);
         settings.DnsCacheMinTtlSec = Clamp(settings.DnsCacheMinTtlSec, 5, 86_400, 60);
