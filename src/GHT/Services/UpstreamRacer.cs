@@ -30,9 +30,26 @@ public sealed class UpstreamRacer
     private readonly LogService _log;
     private readonly ConcurrentDictionary<string, AddressHealth> _health = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// 建连动作。生产环境就是真 socket；测试可注入确定性实现。
+    ///
+    /// 为什么要留这个缝：这几个用例要断言的是「失败被记到了哪个地址、耗时多长、取消不该算失败」，
+    /// 都属于本类自己的逻辑。如果它们依赖真实 TCP 栈，就会被操作系统的报文行为绑架 ——
+    /// 实测 Windows 上连回环上的关闭端口要 <b>2043~2073ms</b> 才收到 RST（正常应低于 1ms），
+    /// 于是 1000ms 的竞速预算先取消，用例断言的「失败」实际变成了「没来得及试」，
+    /// 本地 Linux 通过、CI 的 Windows 失败。
+    /// </summary>
+    private readonly Func<IPAddress, int, CancellationToken, Task<TcpClient>> _connect;
+
     public UpstreamRacer(LogService log)
+        : this(log, connect: null)
+    {
+    }
+
+    internal UpstreamRacer(LogService log, Func<IPAddress, int, CancellationToken, Task<TcpClient>>? connect)
     {
         _log = log;
+        _connect = connect ?? ConnectDirectAsync;
     }
 
     private sealed class AddressHealth
@@ -175,22 +192,41 @@ public sealed class UpstreamRacer
         return ordered;
     }
 
+    /// <summary>
+    /// 生产环境的建连：裸 TCP 握手，对 TLS 完全透明。
+    /// 这里刻意<b>不</b>调整套接字缓冲：竞速时可能有 8 个候选同时建连，
+    /// 给每个都设 256KB 等于把内核缓冲成本乘以候选数，而落败者在几十毫秒内就被释放。
+    /// 调大缓冲放在胜出之后做（ProxyServer.TuneSocket），只对真正跑流量的那一条生效。
+    /// </summary>
+    private static async Task<TcpClient> ConnectDirectAsync(IPAddress address, int port, CancellationToken token)
+    {
+        var client = new TcpClient(address.AddressFamily);
+
+        try
+        {
+            await client.ConnectAsync(address, port, token).ConfigureAwait(false);
+            client.NoDelay = true;
+            return client;
+        }
+        catch
+        {
+            // 失败路径由建连方自己回收；成功的连接交给调用方或 ReapLosersAsync。
+            client.Dispose();
+            throw;
+        }
+    }
+
     private async Task<RaceWin?> TryConnectAsync(
         IPAddress address,
         int port,
         CancellationToken token,
         Action<IPAddress, long>? onFailure = null)
     {
-        var client = new TcpClient(address.AddressFamily);
         var stopwatch = Stopwatch.StartNew();
 
         try
         {
-            // 这里刻意<b>不</b>调整套接字缓冲：竞速时可能有 8 个候选同时建连，
-            // 给每个都设 256KB 等于把内核缓冲成本乘以候选数，而落败者在几十毫秒内就被释放。
-            // 调大缓冲放在胜出之后做（ProxyServer.TuneSocket），只对真正跑流量的那一条生效。
-            await client.ConnectAsync(address, port, token).ConfigureAwait(false);
-            client.NoDelay = true;
+            var client = await _connect(address, port, token).ConfigureAwait(false);
             stopwatch.Stop();
 
             RecordSuccess(address, stopwatch.Elapsed.TotalMilliseconds);
@@ -202,16 +238,13 @@ public sealed class UpstreamRacer
             // 旧实现把两者混为一谈，于是每次预算耗尽都会给全部候选记一次失败，
             // 健康度被系统性污染，好地址会因为「预算小」而被永久降权。
             stopwatch.Stop();
-            client.Dispose();
             return null;
         }
         catch
         {
-            // 失败路径由自己释放；成功的连接交给调用方或 ReapLosersAsync。
             stopwatch.Stop();
             RecordFailure(address);
             onFailure?.Invoke(address, (long)stopwatch.ElapsedMilliseconds);
-            client.Dispose();
             return null;
         }
     }

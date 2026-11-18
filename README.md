@@ -177,14 +177,14 @@ tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平�
 
 | 工作流 | 触发 | 做了什么 |
 |---|---|---|
-| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（131 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
+| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（133 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
 | `release.yml` | 推送 `v*` 标签 | 同上构建，打包 zip 并创建 GitHub Release |
 
 发布新版本：
 
 ```bash
-git tag v1.3.0
-git push origin v1.3.0
+git tag v1.3.1
+git push origin v1.3.1
 ```
 
 ---
