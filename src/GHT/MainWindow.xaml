@@ -172,22 +172,6 @@
                 <CheckBox x:Name="FallbackCheck" Content="候选全失败时用系统 DNS 兜底"
                           ToolTip="加速池解析出的 IP 全部连不上时，再用系统 DNS 试一次；关闭后直接返回 502"
                           VerticalAlignment="Center" Margin="0,0,18,8" />
-                <CheckBox x:Name="GithubMetaCheck" Content="注入 GitHub 官方地址"
-                          ToolTip="把 api.github.com/meta 公布的边缘地址（web/git/api/pages）作为静态候选，用于绕开被污染的 DNS 或落到远端区域的解析结果。不会改变跨境链路带宽。"
-                          VerticalAlignment="Center" Margin="0,0,12,8" />
-                <StackPanel Orientation="Horizontal" Margin="0,0,12,8">
-                    <TextBlock Text="官方地址数" VerticalAlignment="Center" />
-                    <TextBox x:Name="MetaSeedBox" Width="44" Margin="6,0,0,0"
-                             ToolTip="每次选路最多注入几个官方地址；0 表示不注入" />
-                </StackPanel>
-                <CheckBox x:Name="ValidateCheck" Content="竞速前校验 TLS"
-                          ToolTip="443 端口先用 SNI + 证书链校验候选，剔除「TCP 能通但 TLS 失败」的地址；首个请求不额外等待"
-                          VerticalAlignment="Center" Margin="0,0,12,8" />
-                <StackPanel Orientation="Horizontal" Margin="0,0,18,8">
-                    <TextBlock x:Name="MetaStateText" Text="官方地址：启动后加载" FontSize="11"
-                               Foreground="#6B7075" VerticalAlignment="Center" />
-                    <Button x:Name="RefreshMetaButton" Content="刷新" Padding="8,2" Margin="8,0,0,0" />
-                </StackPanel>
                 <CheckBox x:Name="AutoStartCheck" Content="开机自启" VerticalAlignment="Center"
                           Margin="0,0,18,8" />
                 <StackPanel Orientation="Horizontal" Margin="0,0,18,8">

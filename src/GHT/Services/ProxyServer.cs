@@ -5,7 +5,6 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using GHT.Models;
-using GHT.Services.Github;
 using GHT.Services.Http;
 
 namespace GHT.Services;
@@ -75,8 +74,6 @@ public sealed class ProxyServer : IAsyncDisposable
     private readonly LogService _log;
     private readonly ResolverHub _resolver;
     private readonly UpstreamRacer _racer;
-    private readonly UpstreamValidator _validator;
-    private readonly GithubMetaProvider _githubMeta;
     private readonly ProxyStatistics _statistics = new();
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
 
@@ -95,23 +92,12 @@ public sealed class ProxyServer : IAsyncDisposable
         _log = log;
         _resolver = new ResolverHub(settings, log);
         _racer = new UpstreamRacer(log);
-
-        // TLS 判坏必须进竞速的健康度，否则「建连快但用不了」的地址会被反复选中。
-        _validator = new UpstreamValidator(log, _racer.ReportReject);
-        _githubMeta = new GithubMetaProvider(log);
         _whitelist = DomainWildcardList.Parse(settings.GlobalDnsWhitelist);
-
-        // 先读磁盘缓存（几十 KB，同步读），再按需在后台刷新：
-        // 首条连接不应该因为「还没拿到官方地址」而少一路候选。
-        _githubMeta.BeginLoad();
     }
 
     public ProxyStatistics Statistics => _statistics;
 
     public ResolverHub Resolver => _resolver;
-
-    /// <summary>官方地址快照，UI 用来展示加载状态。</summary>
-    public GithubMetaProvider GithubMeta => _githubMeta;
 
     public bool IsRunning => _state == LifecycleState.Running;
 
@@ -246,11 +232,7 @@ public sealed class ProxyServer : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
-    {
-        await StopAsync().ConfigureAwait(false);
-        _githubMeta.Dispose();
-    }
+    public async ValueTask DisposeAsync() => await StopAsync().ConfigureAwait(false);
 
     // ── 接入 ────────────────────────────────────────────────────────────
 
@@ -628,48 +610,25 @@ public sealed class ProxyServer : IAsyncDisposable
         CancellationToken budgetToken,
         CancellationToken clientToken)
     {
-        IReadOnlyList<IPAddress> resolved;
+        IReadOnlyList<IPAddress> candidates;
 
         try
         {
-            resolved = await _resolver.ResolveAsync(host, budgetToken).ConfigureAwait(false);
+            candidates = await _resolver.ResolveAsync(host, budgetToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!clientToken.IsCancellationRequested)
         {
             return (null, PoolOutcome.BudgetExpired);
         }
 
-        var settings = _settings;
-
-        // 官方地址只是候选的补充来源：DNS 池给出的地址反映当前权威答案，优先；
-        // 静态地址用来覆盖「DNS 被污染」和「GeoDNS 分到远端区域」两种 DNS 治不了的病。
-        //
-        // 注意这里不是「随便取 N 个」：官方池有一百多个地址，必须按地址健康度挑 ——
-        // 试出好用的那天起它就稳定留在窗口里，轮换只作用于还没试过的地址。
-        var seedLimit = Math.Clamp(settings.GithubMetaSeedCount, 0, 32);
-
-        IReadOnlyList<IPAddress> seeds = Array.Empty<IPAddress>();
-
-        if (settings.GithubMetaEnabled && seedLimit > 0)
-        {
-            var pool = _githubMeta.GetPool(host);
-            if (pool.Count > 0)
-            {
-                seeds = _racer.RankSeeds(pool, seedLimit);
-            }
-        }
-
-        var merged = CandidateMerger.Merge(resolved, seeds);
-
-        if (merged.Count == 0)
+        if (candidates.Count == 0)
         {
             // 预算已经在等首批结果时被耗尽 → 算预算问题；否则说明池子对这个域名没有答案
             return (null, budgetToken.IsCancellationRequested ? PoolOutcome.BudgetExpired : PoolOutcome.NoCandidates);
         }
 
-        var ordered = ApplyTlsGate(host, port, merged, settings);
-
-        var remaining = new List<IPAddress>(ordered);
+        var settings = _settings;
+        var remaining = new List<IPAddress>(candidates);
         var rounds = Math.Clamp(settings.RaceRetryRounds, 0, 5);
         var maxIps = Math.Clamp(settings.RaceMaxIps, 1, 64);
 
@@ -695,12 +654,6 @@ public sealed class ProxyServer : IAsyncDisposable
                 {
                     _statistics.AddPoolWin();
                     _statistics.SetWinner(host, winner.Ip.ToString());
-
-                    if (seeds.Count > 0 && ContainsAddress(seeds, winner.Ip))
-                    {
-                        _log.Debug($"{host}:{port} 由 GitHub 官方地址胜出：{winner.Ip}");
-                    }
-
                     return (winner.Client, PoolOutcome.Won);
                 }
 
@@ -744,60 +697,6 @@ public sealed class ProxyServer : IAsyncDisposable
         }
 
         return (null, PoolOutcome.CandidatesFailed);
-    }
-
-    /// <summary>
-    /// TLS 校验闸门：已确认可用的排前面，已知不可用的直接剔除，未确认的照常参与竞速并顺手补探测。
-    ///
-    /// 三条边界条件值得写下来，否则很容易把功能改成「变慢」或「变不可用」：
-    /// 1) 冷启动（一条可信记录都没有）时顺序完全不变，首个请求的耗时不受影响；
-    /// 2) 全部候选都被判为不可用时，仍然按原样再试一轮 —— 与其直接 502，不如让用户拿到连接；
-    /// 3) 只有 443 走这道闸门：明文 HTTP 没有 TLS 可言，探测它没有意义。
-    /// </summary>
-    private List<IPAddress> ApplyTlsGate(
-        string host,
-        int port,
-        IReadOnlyList<IPAddress> candidates,
-        AppSettings settings)
-    {
-        if (!settings.ValidateCandidates || port != 443 || candidates.Count == 0)
-        {
-            return new List<IPAddress>(candidates);
-        }
-
-        var verdict = _validator.Partition(host, port, candidates);
-
-        var ordered = new List<IPAddress>(candidates.Count);
-        ordered.AddRange(verdict.Trusted);
-        ordered.AddRange(verdict.Unverified);
-
-        if (ordered.Count == 0)
-        {
-            _log.Debug($"{host}:{port} 全部候选都被 TLS 校验判为不可用，仍按原样竞速一次");
-            ordered.AddRange(candidates);
-        }
-
-        if (verdict.Unverified.Count > 0)
-        {
-            // 用服务生命周期而不是首连预算做取消源：探测结论要留给后续请求用，
-            // 不能因为这一次的预算到期就把已经发出的握手废掉。
-            _validator.Warm(host, port, verdict.Unverified, _cts?.Token ?? CancellationToken.None);
-        }
-
-        return ordered;
-    }
-
-    private static bool ContainsAddress(IReadOnlyList<IPAddress> list, IPAddress address)
-    {
-        for (var i = 0; i < list.Count; i++)
-        {
-            if (list[i].Equals(address))
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     private async Task<TcpClient> ConnectDirectAsync(

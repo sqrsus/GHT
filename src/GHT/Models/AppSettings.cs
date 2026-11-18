@@ -55,27 +55,6 @@ public sealed class AppSettings
     /// <summary>重赛前的等待时间，给后台扫描留出补充候选的机会。</summary>
     public int RaceRetryDelayMs { get; set; } = 800;
 
-    // ── GitHub 官方地址（api.github.com/meta）────────────────
-    /// <summary>
-    /// 是否把 GitHub 官方公布的边缘地址（meta API 的 web/git/api/pages）作为静态候选注入竞速。
-    /// 收益只在两种场景出现：公共 DNS 对 github.com 的答案被污染，或 GeoDNS 把你分到了远端区域。
-    /// 它不会改变跨境链路质量，也不覆盖 release 资产与 LFS。
-    /// </summary>
-    public bool GithubMetaEnabled { get; set; } = true;
-
-    /// <summary>
-    /// 每次选路最多注入多少个官方地址。0 等价于关闭该功能。
-    /// 之所以不把上百个地址全塞进竞速：竞速成本随候选数线性上升，而实测同一份列表里
-    /// 只有少数几个区域对我方链路是快的。
-    /// </summary>
-    public int GithubMetaSeedCount { get; set; } = 4;
-
-    /// <summary>
-    /// 竞速前是否用 TLS（SNI = 目标主机 + 证书链）校验候选，仅对 443 生效。
-    /// 关掉后会退化成「TCP 通就选」，而官方地址里确实存在 TCP 能通、TLS 失败的地址。
-    /// </summary>
-    public bool ValidateCandidates { get; set; } = true;
-
     // ── DNS 扫描与缓存 ──────────────────────────────────────
     /// <summary>扫描公共 DNS 时的并发数。</summary>
     public int DnsScanConcurrency { get; set; } = 128;

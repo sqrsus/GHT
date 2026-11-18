@@ -108,81 +108,6 @@ public sealed class UpstreamRacer
         return null;
     }
 
-    /// <summary>
-    /// 从一个大候选池里挑出「最值得先试」的若干个，用于 GitHub 官方地址这类候选远多于竞速名额的场景。
-    ///
-    /// 与 <see cref="OrderByHealth"/> 的区别只有一条：这里<b>已知可用</b>的排在<b>未知</b>之前。
-    /// 竞速时让未知地址先上是对的（给新地址机会），但挑种子时相反 —— 否则每次请求都在试新地址，
-    /// 好不容易试出来的好地址反而被挤掉，健康度永远学不出结论。
-    /// </summary>
-    public List<IPAddress> RankSeeds(IReadOnlyList<IPAddress> pool, int max)
-    {
-        if (pool.Count == 0 || max <= 0)
-        {
-            return new List<IPAddress>();
-        }
-
-        var now = Environment.TickCount64;
-        var scored = new List<(IPAddress Address, int Index, int Blocked, int Known, double Ewma)>(pool.Count);
-
-        for (var i = 0; i < pool.Count; i++)
-        {
-            var address = pool[i];
-            var blocked = 0;
-            var known = 0;
-            var ewma = 0.0;
-
-            if (_health.TryGetValue(address.ToString(), out var health))
-            {
-                if (health.Failures > 0)
-                {
-                    var backoff = Math.Min(MaxBackoffSeconds, 5 * health.Failures);
-                    if ((now - health.LastFailureTicks) / 1000.0 < backoff)
-                    {
-                        blocked = 1;
-                    }
-                }
-
-                if (health.EwmaMs >= 0)
-                {
-                    known = 1;
-                    ewma = health.EwmaMs;
-                }
-            }
-
-            scored.Add((address, i, blocked, known, ewma));
-        }
-
-        scored.Sort((left, right) =>
-        {
-            if (left.Blocked != right.Blocked)
-            {
-                return left.Blocked.CompareTo(right.Blocked);
-            }
-
-            if (left.Known != right.Known)
-            {
-                return right.Known.CompareTo(left.Known);
-            }
-
-            if (left.Ewma != right.Ewma)
-            {
-                return left.Ewma.CompareTo(right.Ewma);
-            }
-
-            return left.Index.CompareTo(right.Index);
-        });
-
-        var take = Math.Min(max, scored.Count);
-        var picked = new List<IPAddress>(take);
-        for (var i = 0; i < take; i++)
-        {
-            picked.Add(scored[i].Address);
-        }
-
-        return picked;
-    }
-
     /// <summary>按「近期失败优先靠后 → 已知慢的靠后 → 未知的靠前」排序，保持相对顺序稳定。</summary>
     private List<IPAddress> OrderByHealth(IReadOnlyList<IPAddress> candidates)
     {
@@ -278,32 +203,6 @@ public sealed class UpstreamRacer
     {
         var health = _health.GetOrAdd(address.ToString(), _ => new AddressHealth());
         health.Failures++;
-        Volatile.Write(ref health.LastFailureTicks, Environment.TickCount64);
-    }
-
-    /// <summary>
-    /// 外部（TLS 校验闸门）判定某地址不可用。
-    ///
-    /// 与 <see cref="RecordFailure"/> 的区别在于「这次失败意味着什么」：TCP 建连失败可能只是
-    /// 瞬时抖动，而 TLS 证书校验失败意味着这个地址<b>根本不为该主机服务</b>，重试毫无意义。
-    /// 所以直接给一个不低于 3 的失败基数（退避 15 秒起），而不是从 1 慢慢爬 ——
-    /// 否则刚被判坏的地址会立刻又以「TCP 建连只要 4ms」的身份赢下下一次竞速，
-    /// 形成「选得快 → 连不上 → 再选它」的死循环。
-    /// </summary>
-    public void ReportReject(IPAddress? address)
-    {
-        if (address is null)
-        {
-            return;
-        }
-
-        var health = _health.GetOrAdd(address.ToString(), _ => new AddressHealth());
-
-        if (health.Failures < 3)
-        {
-            health.Failures = 3;
-        }
-
         Volatile.Write(ref health.LastFailureTicks, Environment.TickCount64);
     }
 
