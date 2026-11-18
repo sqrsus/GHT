@@ -9,6 +9,16 @@ public sealed class TrayIconService : IDisposable
     private readonly System.Windows.Forms.NotifyIcon _icon;
     private readonly System.Windows.Forms.ToolStripMenuItem _toggleItem;
 
+    /// <summary>图标本体与它依赖的流（<see cref="System.Drawing.Icon(Stream, System.Drawing.Size)"/> 要求流存活到图标释放）。</summary>
+    private readonly System.Drawing.Icon _appIcon;
+    private readonly Stream? _iconStream;
+
+    /// <summary>
+    /// 图标是否由本类创建。<c>SystemIcons.Application</c> 是进程级共享实例，
+    /// 释放它会让同进程其它地方拿到的同名图标一起失效，所以只有自己创建的才收。
+    /// </summary>
+    private readonly bool _ownsAppIcon;
+
     public TrayIconService(Action onShow, Action onToggle, Action onExit)
     {
         var menu = new System.Windows.Forms.ContextMenuStrip();
@@ -27,15 +37,69 @@ public sealed class TrayIconService : IDisposable
         menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
         menu.Items.Add(exitItem);
 
+        _appIcon = LoadAppIcon(out _iconStream, out _ownsAppIcon);
+
         _icon = new System.Windows.Forms.NotifyIcon
         {
-            Icon = System.Drawing.SystemIcons.Application,
+            Icon = _appIcon,
             Text = "GHT - GitHub 加速",
             Visible = true,
             ContextMenuStrip = menu
         };
 
         _icon.DoubleClick += (_, _) => onShow();
+    }
+
+    /// <summary>
+    /// 托盘图标：优先取 exe 内嵌的 Win32 图标，这样任务栏、资源管理器、托盘三处一致。
+    /// 开发期用 <c>dotnet run</c> 时 apphost 可能还没有图标，再退回程序集里的 <c>Resources/app.ico</c>。
+    /// 两档都失败才用系统默认图标 —— 托盘图标缺失不该影响代理本身。
+    /// </summary>
+    private static System.Drawing.Icon LoadAppIcon(out Stream? keepAlive, out bool owned)
+    {
+        keepAlive = null;
+        owned = false;
+
+        try
+        {
+            var path = Environment.ProcessPath;
+            if (!string.IsNullOrEmpty(path))
+            {
+                var fromExe = System.Drawing.Icon.ExtractAssociatedIcon(path);
+                if (fromExe is not null)
+                {
+                    owned = true;
+                    return fromExe;
+                }
+            }
+        }
+        catch
+        {
+            // 读不到 exe 图标属正常（未发布、被占用、路径异常），继续走下一档
+        }
+
+        try
+        {
+            var resource = System.Windows.Application.GetResourceStream(
+                new Uri("Resources/app.ico", UriKind.Relative));
+
+            if (resource?.Stream is not null)
+            {
+                var buffer = new MemoryStream();
+                resource.Stream.CopyTo(buffer);
+                buffer.Position = 0;
+
+                keepAlive = buffer;
+                owned = true;
+                return new System.Drawing.Icon(buffer, new System.Drawing.Size(32, 32));
+            }
+        }
+        catch
+        {
+            // 同上：图标问题不阻断托盘
+        }
+
+        return System.Drawing.SystemIcons.Application;
     }
 
     /// <summary>
@@ -74,6 +138,21 @@ public sealed class TrayIconService : IDisposable
         {
             _icon.Visible = false;
             _icon.Dispose();
+        }
+        catch
+        {
+            // ignore
+        }
+
+        // NotifyIcon 不会释放被赋值的 Icon，这里自己收：否则每次重建托盘都会漏一个图标句柄
+        try
+        {
+            if (_ownsAppIcon)
+            {
+                _appIcon.Dispose();
+            }
+
+            _iconStream?.Dispose();
         }
         catch
         {

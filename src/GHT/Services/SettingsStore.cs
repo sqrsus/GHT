@@ -256,22 +256,29 @@ public static class SettingsStore
     }
 
     /// <summary>把越界值收敛到合法区间，并补齐可能被外部改坏的空引用。</summary>
+    /// <remarks>
+    /// 这里的兜底值一律取自 <see cref="AppSettings"/> 的默认值，而不是再抄一份字面量：
+    /// 抄写的那份不会跟着默认值一起改，结果是「默认值调了、越界回退的还是老值」，
+    /// 这类不一致在配置文件被手工改坏时最难排查。
+    /// </remarks>
     public static AppSettings Normalize(AppSettings settings)
     {
-        settings.ProxyPort = Clamp(settings.ProxyPort, 1024, 65535, 7890);
-        settings.ConnectBudgetMs = Clamp(settings.ConnectBudgetMs, 0, 60_000, 3000);
-        settings.RaceMaxIps = Clamp(settings.RaceMaxIps, 1, 64, 8);
-        settings.RaceConnectTimeoutMs = Clamp(settings.RaceConnectTimeoutMs, 200, 60_000, 5000);
-        settings.RaceBatchBudgetMs = Clamp(settings.RaceBatchBudgetMs, 200, 120_000, 3000);
-        settings.RaceRetryRounds = Clamp(settings.RaceRetryRounds, 0, 5, 2);
-        settings.RaceRetryDelayMs = Clamp(settings.RaceRetryDelayMs, 100, 60_000, 800);
-        settings.DnsScanConcurrency = Clamp(settings.DnsScanConcurrency, 1, 1024, 128);
-        settings.DnsScanTimeoutMs = Clamp(settings.DnsScanTimeoutMs, 200, 20_000, 2000);
-        settings.DnsCacheMinTtlSec = Clamp(settings.DnsCacheMinTtlSec, 5, 86_400, 60);
-        settings.DnsCacheMaxTtlSec = Clamp(settings.DnsCacheMaxTtlSec, settings.DnsCacheMinTtlSec, 86_400, 600);
-        settings.FirstBatchCollectMs = Clamp(settings.FirstBatchCollectMs, 0, 5000, 600);
-        settings.FirstBatchMinIps = Clamp(settings.FirstBatchMinIps, 1, 64, 5);
-        settings.PoolResolveConcurrency = Clamp(settings.PoolResolveConcurrency, 1, 256, 24);
+        var defaults = new AppSettings();
+
+        settings.ProxyPort = Clamp(settings.ProxyPort, 1024, 65535, defaults.ProxyPort);
+        settings.ConnectBudgetMs = Clamp(settings.ConnectBudgetMs, 0, 60_000, defaults.ConnectBudgetMs);
+        settings.RaceMaxIps = Clamp(settings.RaceMaxIps, 1, 64, defaults.RaceMaxIps);
+        settings.RaceConnectTimeoutMs = Clamp(settings.RaceConnectTimeoutMs, 200, 60_000, defaults.RaceConnectTimeoutMs);
+        settings.RaceBatchBudgetMs = Clamp(settings.RaceBatchBudgetMs, 200, 120_000, defaults.RaceBatchBudgetMs);
+        settings.RaceRetryRounds = Clamp(settings.RaceRetryRounds, 0, 5, defaults.RaceRetryRounds);
+        settings.RaceRetryDelayMs = Clamp(settings.RaceRetryDelayMs, 100, 60_000, defaults.RaceRetryDelayMs);
+        settings.DnsScanConcurrency = Clamp(settings.DnsScanConcurrency, 1, 1024, defaults.DnsScanConcurrency);
+        settings.DnsScanTimeoutMs = Clamp(settings.DnsScanTimeoutMs, 200, 20_000, defaults.DnsScanTimeoutMs);
+        settings.DnsCacheMinTtlSec = Clamp(settings.DnsCacheMinTtlSec, 5, 86_400, defaults.DnsCacheMinTtlSec);
+        settings.DnsCacheMaxTtlSec = Clamp(settings.DnsCacheMaxTtlSec, settings.DnsCacheMinTtlSec, 86_400, defaults.DnsCacheMaxTtlSec);
+        settings.FirstBatchCollectMs = Clamp(settings.FirstBatchCollectMs, 0, 5000, defaults.FirstBatchCollectMs);
+        settings.FirstBatchMinIps = Clamp(settings.FirstBatchMinIps, 1, 64, defaults.FirstBatchMinIps);
+        settings.PoolResolveConcurrency = Clamp(settings.PoolResolveConcurrency, 1, 256, defaults.PoolResolveConcurrency);
 
         settings.GlobalDnsWhitelist = NormalizeWhitelist(settings.GlobalDnsWhitelist);
         settings.DnsPoolDomain = string.IsNullOrWhiteSpace(settings.DnsPoolDomain) ? "github.com" : settings.DnsPoolDomain.Trim();

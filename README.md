@@ -44,7 +44,7 @@ GHT 是一个 Windows 桌面小工具：在本机开一个 HTTP 代理，**只�
 
 四条关键设计：
 
-1. **首连预算（默认 3000ms）只包住「选路」**，不包住数据转发。预算到点就先用系统 DNS 连上，DNS 扫描在后台继续，下一个请求即可命中新结果——不会出现「明明能直连却报 502」，也不会掐断长下载。
+1. **首连预算（默认 12000ms）只包住「选路」**，不包住数据转发。预算到点就先用系统 DNS 连上，DNS 扫描在后台继续，下一个请求即可命中新结果——不会出现「明明能直连却报 502」，也不会掐断长下载。
 2. **首批候选是真正的时间窗口**：任一 DNS 查询一返回就合并结果并尝试发布，另有独立计时器到点强制发布；首批只问延迟低、近期成功率高的前若干台，其余交给后台 worker 补齐。不会因为「这一批里有一台 DNS 慢」就把整个窗口拖到单次 DNS 超时。
 3. **扫描任务不接调用方的取消令牌**。调用方放弃等待 ≠ 扫描被取消。
 4. **回落按原因分项计数**：池为空 / 预算到期 / 无解析答案 / 候选全失败，四种情况的修法完全不同。候选全部建连失败时默认再用系统 DNS 兜底（`FallbackOnCandidatesFailed`，可关）；严格语义下才回 502。
@@ -120,22 +120,32 @@ dotnet publish src/GHT/GHT.csproj -c Release -r win-x64 --self-contained false `
 
 若本机存在旧版 `%LOCALAPPDATA%\CloudflareSmartProxy\settings.json`，首次启动会自动复制一份过来（不覆盖已有文件）。
 
+默认值按**可用性优先**取值：宁可首连多花一两秒，也不要把「其实连得上」的候选提前掐断。三个预算参数构成一组相互约束的组合，改其中一个必须同时检查另外两个：
+
+```
+ConnectBudgetMs (12000) >  RaceConnectTimeoutMs (8000)   # 总预算要够一次尝试得出确定结论
+RaceBatchBudgetMs (9000) >= RaceConnectTimeoutMs (8000)  # 批预算不能先于单地址超时到期
+RaceBatchBudgetMs (9000) <  ConnectBudgetMs (12000)      # 否则批预算永远不会生效
+```
+
+违反第一条会稳定复现「首连预算用尽」：每个地址都还没到自己的超时就被整体取消，既拿不到连接，也拿不到「这个地址不行」的结论。`tests/GHT.Tests/SettingsTests.cs` 里有一条用例专门守这组关系。
+
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `ProxyPort` | `7890` | 本地监听端口，仅绑定 `127.0.0.1` |
 | `GlobalDnsWhitelist` | GitHub 相关 16 条 | 逗号/分号/换行分隔，支持 `*.` 前缀通配；**可清空**，清空即全部走系统 DNS。只接受主机名（字母数字与 `.-_`），误贴的 `https://…`、`host:port`、带路径的条目会被丢弃；最多 256 条 |
 | `DnsAccelEnabled` | `true` | 总开关 |
-| `ConnectBudgetMs` | `3000` | 首连预算；`0` = 不限（等价旧行为，作为回滚开关）。应略大于单个地址的失败耗时，否则竞速会被掐断而给不出结论 |
+| `ConnectBudgetMs` | `12000` | 首连预算；`0` = 不限（等价旧行为，作为回滚开关）。**必须大于 `RaceConnectTimeoutMs`**，否则竞速会在单个地址给出结论前被整体取消 |
 | `FallbackOnCandidatesFailed` | `true` | 加速池候选全部连不上时，再用系统 DNS 兜底；`false` = 直接 502（严格语义） |
 | `RaceMaxIps` | `8` | 单批并发竞速的 IP 数 |
-| `RaceConnectTimeoutMs` | `5000` | 单个 IP 建连超时 |
-| `RaceBatchBudgetMs` | `3000` | 单批竞速总预算（应小于 `ConnectBudgetMs`，否则永远不会生效） |
-| `RaceRetryRounds` | `2` | 全批失败后的重赛轮数 |
-| `RaceRetryDelayMs` | `800` | 重赛前等待（给后台扫描补候选的机会） |
+| `RaceConnectTimeoutMs` | `8000` | 单个 IP 建连超时。跨境链路在丢包/拥塞时握手花 5~7s 并不罕见，5s 会把「慢但能用」的地址判死 |
+| `RaceBatchBudgetMs` | `9000` | 单批竞速总预算。须满足 `RaceConnectTimeoutMs ≤ 它 < ConnectBudgetMs`，否则不是把地址半路取消，就是永远不生效 |
+| `RaceRetryRounds` | `3` | 全批失败后的重赛轮数 |
+| `RaceRetryDelayMs` | `1500` | 重赛前等待（给后台扫描补候选的机会） |
 | `DnsScanConcurrency` | `128` | 扫描公共 DNS 的并发数 |
-| `DnsScanTimeoutMs` | `2000` | 单次 DNS 查询超时 |
-| `DnsCacheMinTtlSec` / `DnsCacheMaxTtlSec` | `60` / `600` | 解析结果缓存 TTL 区间（逐地址计时） |
-| `FirstBatchCollectMs` | `600` | 首批窗口：到点无论凑够几个都先返回（`0` = 拿到第一个答案就返回）。过小会让首批只拿到国内 DNS 的趋同答案，候选退化成单点 |
+| `DnsScanTimeoutMs` | `3000` | 单次 DNS 查询超时（池里不少境外解析器，2000 时常在窗口内答不完） |
+| `DnsCacheMinTtlSec` / `DnsCacheMaxTtlSec` | `300` / `1800` | 解析结果缓存 TTL 区间（逐地址计时）。放宽以减少「反复解析换赌注」，失效地址由竞速健康度与失败退避兜住 |
+| `FirstBatchCollectMs` | `1200` | 首批窗口：到点无论凑够几个都先返回（`0` = 拿到第一个答案就返回）。过小会让首批只拿到国内 DNS 的趋同答案，候选退化成单点 |
 | `FirstBatchMinIps` | `5` | 首批凑够几个 IP 就提前返回 |
 | `PoolResolveConcurrency` | `24` | 后台补齐时并发使用的 DNS 数量 |
 | `PreferIpv4` | `true` | 候选排序优先 IPv4 |
@@ -147,6 +157,8 @@ dotnet publish src/GHT/GHT.csproj -c Release -r win-x64 --self-contained false `
 | `DnsLastScanDomain` | `""` | 最后一次扫描的域名 |
 
 旧配置里的 `SpeedTestUrl`、`PreferredEdges`、`MitmEnabled` 等废弃字段会被静默忽略，不会报错。
+
+> **升级不会覆盖你已有的 `settings.json`**：新版本的默认值只对「文件里没有这个字段」或「点了参数区『恢复默认值』」的情况生效。想用新的一套默认值，在界面上点一次「恢复默认值」即可（它只重置参数区那几项，不动加速池与白名单）。
 
 ---
 
@@ -162,6 +174,10 @@ src/GHT/
 │   ├── AppSettings.cs         配置模型（含默认白名单）
 │   ├── DnsPoolEntry.cs        加速池条目
 │   └── ProxyStatistics.cs     计数器快照（含字节数、活跃隧道、首连 P50/P95）
+├── Resources/
+│   ├── app.ico                应用图标：16/20/24/32/40/48/64/128/256 共 9 帧，
+│   │                          exe 的 Win32 图标、窗口标题栏、托盘三处共用同一份
+│   └── public-dns-servers.json  内置公共 DNS 清单（扫描候选池）
 └── Services/
     ├── ProxyServer.cs         接入、选路编排、隧道与明文转发
     ├── ProxyProtocol.cs       HTTP 常量、逐跳头规则、错误响应
@@ -193,8 +209,8 @@ tests/GHT.Tests/               单元测试 + 网络边界集成测试（链接�
 
 | 工作流 | 触发 | 做了什么 |
 |---|---|---|
-| `build.yml` | push / PR 到 `main`、手动 | restore → **依赖漏洞扫描** → build → **dotnet test（182 例）** → publish 单文件 exe → **校验 exe 版本资源与 csproj 一致** → 生成 `SHA256SUMS.txt` → 上传 `GHT-win-x64` artifact |
-| `release.yml` | 推送 `v*` 标签 | **校验标签与程序集版本一致**（不一致直接失败）→ 漏洞扫描 → build → test → publish → 校验版本资源 → 生成 SHA256 → 打包 zip → 创建 Release（附 zip 与 `SHA256SUMS.txt`） |
+| `build.yml` | push / PR 到 `main`、手动 | restore → **依赖漏洞扫描** → build → **dotnet test（183 例）** → publish 单文件 exe → **校验 exe 版本资源与 csproj 一致** → 生成 `SHA256SUMS.txt` → 上传 `GHT-win-x64` artifact |
+| `release.yml` | 推送 `v*` 标签 | **校验标签与程序集版本一致**（不一致直接失败）→ 漏洞扫描 → build → test → publish → 校验版本资源 → 生成 SHA256 → 打包 zip → 创建 Release（附 zip 与 `SHA256SUMS.txt`；若 `docs/release-notes/<tag>.md` 存在就用它作正文，否则自动生成） |
 
 `build.yml` 支持手动触发时勾选「独立部署」：产物改为 `--self-contained true` 并开启压缩，用户无需预装 .NET 桌面运行时；代价是单文件体积显著变大，因此默认仍走框架依赖。
 
@@ -202,8 +218,8 @@ tests/GHT.Tests/               单元测试 + 网络边界集成测试（链接�
 
 ```bash
 # csproj 里的 <Version> 必须与标签一致，否则 release.yml 第一步就会失败
-git tag v1.4.0
-git push origin v1.4.0
+git tag v1.5.0
+git push origin v1.5.0
 ```
 
 > **关于签名**：仓库里没有可用的代码签名证书，因此产物**未做签名**。作为替代，Release 附带 `SHA256SUMS.txt`，下载后可自行校验（`certutil -hashfile GHT.exe SHA256`）。要做可信发布，需要在 secrets 里配置证书并在发布前用 `signtool` 签名 —— 在没有证书的情况下伪造「签名流程」只会给用户错误的安全感，所以这里明确留空。

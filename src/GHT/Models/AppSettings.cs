@@ -5,6 +5,16 @@ namespace GHT.Models;
 /// <summary>
 /// 应用配置。属性名与旧版（CloudflareSmartProxy）保持一致，因此旧 settings.json 可直接读取；
 /// 旧配置中已废弃的字段（SpeedTestUrl / PreferredEdges / MitmEnabled ...）会被 System.Text.Json 静默忽略。
+///
+/// 默认值取向：<b>可用性优先</b>。宁可首连多花一两秒，也不要因为预算太紧而把「其实连得上」的候选掐断。
+/// 三个与预算相关的默认值构成一组自洽的组合，改其中一个必须同时检查另外两个：
+/// <code>
+/// ConnectBudgetMs (12000) &gt; RaceConnectTimeoutMs (8000)           // 总预算要够一次尝试得出确定结论
+/// RaceBatchBudgetMs (9000)  &gt;= RaceConnectTimeoutMs (8000)        // 批预算不能先于单地址超时到期
+/// RaceBatchBudgetMs (9000)  &lt; ConnectBudgetMs (12000)             // 否则批预算永远不生效
+/// </code>
+/// 违反第一条会稳定复现「首连预算用尽」：每个地址都还没到自己的超时就被整体取消，
+/// 既拿不到可用连接，也拿不到「这个地址不行」的结论。
 /// </summary>
 public sealed class AppSettings
 {
@@ -31,12 +41,13 @@ public sealed class AppSettings
     /// 设为 0 表示不限预算（等价于改造前「等扫描完成」的行为，作为回滚开关）。
     /// </summary>
     /// <remarks>
-    /// 默认值从 1500 提到 3000 是有实测依据的：不可达的上游地址（SYN 无响应）
-    /// 建连失败要 3000ms 左右才返回，1500ms 会在「还没试出结论」时就掐断竞速，
-    /// 日志表现为「首连预算用尽」，而真实原因可能是候选里混了坏地址。
-    /// 预算略大于失败耗时，才能让竞速给出确定结论而不是被截断。
+    /// 默认值 12000 是「可用性优先」的结果，必须大于 <see cref="RaceConnectTimeoutMs"/>：
+    /// 预算比单地址超时还小的话，第一批里只要没有快速连通的地址，整批就会在各自超时之前被取消，
+    /// 日志表现为「首连预算用尽」——而真实原因是预算把一次还没做完的尝试掐断了。
+    /// 预算略大于失败耗时，竞速才能给出确定结论。设 0 表示不限（回滚开关），
+    /// 代价是最坏要等到所有轮次跑完才回落系统 DNS。
     /// </remarks>
-    public int ConnectBudgetMs { get; set; } = 3000;
+    public int ConnectBudgetMs { get; set; } = 12000;
 
     /// <summary>
     /// 加速池候选全部建连失败后，是否再用系统 DNS 兜底（默认开）。
@@ -50,43 +61,54 @@ public sealed class AppSettings
     public int RaceMaxIps { get; set; } = 8;
 
     /// <summary>单个 IP 的 TCP 建连超时。</summary>
-    public int RaceConnectTimeoutMs { get; set; } = 5000;
+    /// <remarks>
+    /// 8000 而不是 5000：跨境链路在丢包/拥塞时，TCP 握手花 5~7 秒才完成并不罕见，
+    /// 5 秒会把「慢但能用」的地址判死。放宽它的代价只是坏地址拖得更久，
+    /// 而这里的目标是连得上，不是连得快。
+    /// </remarks>
+    public int RaceConnectTimeoutMs { get; set; } = 8000;
 
     /// <summary>
     /// 单批竞速的总时长上限。
-    /// 应当小于 <see cref="ConnectBudgetMs"/>：批预算比总预算还大时，它永远不会生效，
-    /// 等于只有一个隐形的总预算在起作用，调它没有任何意义。
+    /// 必须满足 <c>RaceConnectTimeoutMs &lt;= RaceBatchBudgetMs &lt; ConnectBudgetMs</c>：
+    /// 小于单地址超时会把还没试完的地址一起取消；大于等于总预算则永远不会生效。
     /// </summary>
-    public int RaceBatchBudgetMs { get; set; } = 3000;
+    public int RaceBatchBudgetMs { get; set; } = 9000;
 
     /// <summary>整批候选都失败后的重赛轮数。</summary>
-    public int RaceRetryRounds { get; set; } = 2;
+    public int RaceRetryRounds { get; set; } = 3;
 
     /// <summary>重赛前的等待时间，给后台扫描留出补充候选的机会。</summary>
-    public int RaceRetryDelayMs { get; set; } = 800;
+    public int RaceRetryDelayMs { get; set; } = 1500;
 
     // ── DNS 扫描与缓存 ──────────────────────────────────────
     /// <summary>扫描公共 DNS 时的并发数。</summary>
     public int DnsScanConcurrency { get; set; } = 128;
 
     /// <summary>单个 DNS 查询超时。</summary>
-    public int DnsScanTimeoutMs { get; set; } = 2000;
+    /// <remarks>3000 给跨境 DNS 留足往返：池里有不少境外解析器，2000 时它们常在窗口内答不完。</remarks>
+    public int DnsScanTimeoutMs { get; set; } = 3000;
 
     /// <summary>解析结果缓存的最小 TTL（秒）。</summary>
-    public int DnsCacheMinTtlSec { get; set; } = 60;
+    public int DnsCacheMinTtlSec { get; set; } = 300;
 
     /// <summary>解析结果缓存的最大 TTL（秒）。</summary>
-    public int DnsCacheMaxTtlSec { get; set; } = 600;
+    /// <remarks>
+    /// 放宽到 300/1800 是为了减少「反复解析」：每一次重新解析都是一次重新赌候选，
+    /// 已经验证能连上的地址多留一会儿，比反复撞新地址更容易连得上。
+    /// 地址失效由竞速的健康度与失败退避兜住，不会因为缓存长而卡死在坏地址上。
+    /// </remarks>
+    public int DnsCacheMaxTtlSec { get; set; } = 1800;
 
     /// <summary>
     /// 首批结果聚合窗口；0 表示不聚合，拿到第一批立刻返回。
     /// </summary>
     /// <remarks>
-    /// 默认值从 200 提到 600：200ms 时通常只有国内公共 DNS 来得及答复，
-    /// 而它们对同一域名的答案高度趋同，去重后往往只剩一个候选 —— 竞速退化成单点赌注。
-    /// 600ms 能让境外 DNS（实测 45~100ms）也进入首批，候选从 1 个变成多个。
+    /// 默认 1200：200~600ms 通常只有国内公共 DNS 来得及答复，而它们对同一域名的答案高度趋同，
+    /// 去重后往往只剩一个候选 —— 竞速退化成单点赌注。1200ms 能让境外 DNS（实测 45~100ms，
+    /// 但排队与丢包重传会拉长）也进入首批，候选数量直接决定「有没有别的路可走」。
     /// </remarks>
-    public int FirstBatchCollectMs { get; set; } = 600;
+    public int FirstBatchCollectMs { get; set; } = 1200;
 
     /// <summary>首批至少凑够多少个 IP 就提前返回。</summary>
     public int FirstBatchMinIps { get; set; } = 5;

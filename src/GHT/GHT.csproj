@@ -13,9 +13,11 @@
     <AssemblyName>GHT</AssemblyName>
     <RootNamespace>GHT</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>1.4.0</Version>
-    <AssemblyVersion>1.4.0.0</AssemblyVersion>
-    <FileVersion>1.4.0.0</FileVersion>
+    <!-- 用正斜杠：本地也会在 WSL/Linux 上用 EnableWindowsTargeting 交叉编译，反斜杠在那里解析不了 -->
+    <ApplicationIcon>Resources/app.ico</ApplicationIcon>
+    <Version>1.5.0</Version>
+    <AssemblyVersion>1.5.0.0</AssemblyVersion>
+    <FileVersion>1.5.0.0</FileVersion>
     <Product>GHT - GitHub 访问加速</Product>
     <Company>GHT</Company>
     <Copyright>Copyright (c) 2026 sqrsus</Copyright>
@@ -28,6 +30,12 @@
     <EmbeddedResource Include="Resources\public-dns-servers.json">
       <LogicalName>GHT.Resources.public-dns-servers.json</LogicalName>
     </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 同一份 ico 既作为 exe 的 Win32 图标（上面的 ApplicationIcon），也作为 WPF 资源：
+         窗口标题栏与托盘都用它，避免出现「任务栏一个图标、托盘另一个图标」。 -->
+    <Resource Include="Resources\app.ico" />
   </ItemGroup>
 
 </Project>

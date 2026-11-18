@@ -118,8 +118,21 @@ jobs:
           # 产物未做代码签名（仓库里没有可用的签名证书）：因此同时附上 SHA256 清单，
           # 让用户能独立校验下载到的文件与构建产物一致。要启用签名，需在仓库 secrets
           # 中配置证书并用 signtool 在发布前签名，未配置前不做「假签名」。
-          gh release create "${{ github.ref_name }}" `
-            "GHT-${{ github.ref_name }}-win-x64.zip" `
-            "dist/SHA256SUMS.txt" `
-            --title "GHT ${{ github.ref_name }}" `
-            --generate-notes
+          #
+          # 正文优先用版本自带的说明文件：自动生成的 notes 只有提交标题，
+          # 讲不清「默认值变了、老配置不会跟着变」这类用户真正需要知道的事。
+          $notes = "docs/release-notes/${{ github.ref_name }}.md"
+          $assets = @("GHT-${{ github.ref_name }}-win-x64.zip", "dist/SHA256SUMS.txt")
+
+          if (Test-Path $notes) {
+            Write-Host "使用版本说明：$notes"
+            gh release create "${{ github.ref_name }}" @assets `
+              --title "GHT ${{ github.ref_name }}" `
+              --notes-file $notes
+          }
+          else {
+            Write-Host '未找到版本说明文件，改用自动生成的 notes'
+            gh release create "${{ github.ref_name }}" @assets `
+              --title "GHT ${{ github.ref_name }}" `
+              --generate-notes
+          }

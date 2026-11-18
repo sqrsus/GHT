@@ -23,7 +23,29 @@ public sealed class SettingsTests
     {
         var settings = new AppSettings { ConnectBudgetMs = -1 };
         SettingsStore.Normalize(settings);
-        Assert.Equal(3000, settings.ConnectBudgetMs);
+        Assert.Equal(new AppSettings().ConnectBudgetMs, settings.ConnectBudgetMs);
+    }
+
+    /// <summary>
+    /// 三个预算参数的关系是「能不能连上」的核心约束，不能只靠注释维持：
+    /// 破坏第一条就会稳定复现「首连预算用尽」（每个地址都没到自己的超时就被整体取消）。
+    /// </summary>
+    [Fact]
+    public void Default_budgets_are_mutually_consistent()
+    {
+        var settings = new AppSettings();
+
+        Assert.True(
+            settings.ConnectBudgetMs > settings.RaceConnectTimeoutMs,
+            $"总预算 {settings.ConnectBudgetMs} 必须大于单地址超时 {settings.RaceConnectTimeoutMs}");
+
+        Assert.True(
+            settings.RaceBatchBudgetMs >= settings.RaceConnectTimeoutMs,
+            $"批预算 {settings.RaceBatchBudgetMs} 不能小于单地址超时 {settings.RaceConnectTimeoutMs}");
+
+        Assert.True(
+            settings.RaceBatchBudgetMs < settings.ConnectBudgetMs,
+            $"批预算 {settings.RaceBatchBudgetMs} 必须小于总预算 {settings.ConnectBudgetMs}，否则永不生效");
     }
 
     [Fact]
