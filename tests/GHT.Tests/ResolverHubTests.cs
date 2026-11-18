@@ -88,8 +88,13 @@ public sealed class ResolverHubTests : IDisposable
         var candidates = await hub.ResolveAsync("github.com", CancellationToken.None);
         watch.Stop();
 
+        // 上限取「单次 DNS 超时（2000ms）」这条参照线，而不是拍一个更小的数：
+        // 本用例要证明的性质就是「首批时间由窗口决定，不会被慢 DNS 拖到 DNS 超时」，
+        // 慢的那台要 3000ms 才答，所以 <2000ms 已经足以排除「等了整批」。
+        // （曾用 1500ms：CI 的 Windows 运行器在并行负载下 Timer/线程池续体会抖到 1524ms，
+        //  失败的是运行器调度而不是被测逻辑，断言比性质更严就成了噪声源。）
         Assert.True(
-            watch.ElapsedMilliseconds < 1500,
+            watch.ElapsedMilliseconds < 2000,
             $"首批被一台慢 DNS 拖住了：{watch.ElapsedMilliseconds}ms（旧实现会等到 3000ms）");
 
         Assert.Equal(5, candidates.Count);
@@ -113,8 +118,10 @@ public sealed class ResolverHubTests : IDisposable
         watch.Stop();
 
         Assert.Empty(candidates);
+
+        // 同上：参照线是「慢查询要 3000ms」，只要远早于它返回就说明是窗口在起作用
         Assert.True(
-            watch.ElapsedMilliseconds < 1200,
+            watch.ElapsedMilliseconds < 2000,
             $"无答案时应该按窗口立刻回落，实际等了 {watch.ElapsedMilliseconds}ms");
     }
 
