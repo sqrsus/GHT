@@ -73,6 +73,8 @@ public partial class MainWindow : Window
         LogFilterBox.SelectionChanged += OnLogFilterChanged;
         AutoStartCheck.Checked += OnAutoStartChanged;
         AutoStartCheck.Unchecked += OnAutoStartChanged;
+        FallbackCheck.Checked += OnFallbackChanged;
+        FallbackCheck.Unchecked += OnFallbackChanged;
         CloseActionBox.SelectionChanged += OnCloseActionChanged;
 
         foreach (var box in new[] { RaceMaxIpsBox, BudgetBox, RaceTimeoutBox, RetryRoundsBox, ScanConcurrencyBox, ScanTimeoutBox })
@@ -130,6 +132,7 @@ public partial class MainWindow : Window
             RetryRoundsBox.Text = _settings.RaceRetryRounds.ToString(CultureInfo.InvariantCulture);
             ScanConcurrencyBox.Text = _settings.DnsScanConcurrency.ToString(CultureInfo.InvariantCulture);
             ScanTimeoutBox.Text = _settings.DnsScanTimeoutMs.ToString(CultureInfo.InvariantCulture);
+            FallbackCheck.IsChecked = _settings.FallbackOnCandidatesFailed;
 
             // 自启状态以注册表为准：可能被组策略或用户手工改过，配置里的值不一定可信。
             var autoStart = AutoStart.Get();
@@ -598,6 +601,7 @@ public partial class MainWindow : Window
         _settings.DnsCacheMaxTtlSec = defaults.DnsCacheMaxTtlSec;
         _settings.RaceBatchBudgetMs = defaults.RaceBatchBudgetMs;
         _settings.PreferIpv4 = defaults.PreferIpv4;
+        _settings.FallbackOnCandidatesFailed = defaults.FallbackOnCandidatesFailed;
 
         SettingsStore.Normalize(_settings);
         RefreshTuningBoxes();
@@ -614,6 +618,19 @@ public partial class MainWindow : Window
         RetryRoundsBox.Text = _settings.RaceRetryRounds.ToString(CultureInfo.InvariantCulture);
         ScanConcurrencyBox.Text = _settings.DnsScanConcurrency.ToString(CultureInfo.InvariantCulture);
         ScanTimeoutBox.Text = _settings.DnsScanTimeoutMs.ToString(CultureInfo.InvariantCulture);
+        FallbackCheck.IsChecked = _settings.FallbackOnCandidatesFailed;
+    }
+
+    private void OnFallbackChanged(object sender, RoutedEventArgs e)
+    {
+        if (_loading)
+        {
+            return;
+        }
+
+        _settings.FallbackOnCandidatesFailed = FallbackCheck.IsChecked == true;
+        SettingsStore.Save(_settings, _log);
+        _proxy?.UpdateSettings(_settings);
     }
 
     private static int ParseInt(TextBox box, int fallback) =>
@@ -834,10 +851,12 @@ public partial class MainWindow : Window
         var cacheHits = _proxy?.Resolver.CacheHits ?? 0;
 
         var text =
-            $"请求 {stats.Requests} · 池胜 {stats.PoolWins} · 回落 {stats.BudgetFallbacks} · 直连 {stats.DirectConnects}" +
+            $"请求 {stats.Requests} · 池胜 {stats.PoolWins} · 池败 {stats.PoolLosses} · 直连 {stats.DirectConnects}" +
             $" · 缓存 {cacheHits} · 隧道 {stats.Tunnels}（活跃 {stats.ActiveTunnels}） · 失败 {stats.Errors}" +
             $"　|　↑ {FormatRate(upRate)}　↓ {FormatRate(downRate)}" +
             $" · 首连 P50 {stats.ConnectP50Ms}ms / P95 {stats.ConnectP95Ms}ms";
+
+        text += Environment.NewLine + BuildFallbackLine(stats);
 
         if (!string.IsNullOrEmpty(stats.LastWinner))
         {
@@ -853,6 +872,28 @@ public partial class MainWindow : Window
 
         RefreshPoolHealth();
         UpdateTraySpeed(upRate, downRate);
+    }
+
+    /// <summary>
+    /// 回落要按原因拆开展示：只显示一个总数的话，「预算太紧」和「池子对该域名没答案」
+    /// 看起来一模一样，而两者的修法完全相反（前者调预算，后者换池子）。
+    /// 后面跟的「系统 DNS 成功 N/M」决定该不该继续保留回落策略。
+    /// </summary>
+    private static string BuildFallbackLine(ProxyStatsSnapshot stats)
+    {
+        var fallbacks = stats.Fallbacks;
+
+        if (fallbacks == 0)
+        {
+            return "回落 0（尚未发生系统 DNS 回落）";
+        }
+
+        var attempted = stats.FallbackDirectOk + stats.FallbackDirectFail;
+        var rate = stats.FallbackSuccessRate * 100;
+
+        return $"回落 {fallbacks} = 预算 {stats.FallbackBudget} / 空池 {stats.FallbackPoolEmpty}" +
+               $" / 无答案 {stats.FallbackNoAnswer} / 候选耗尽 {stats.FallbackCandidates}" +
+               $"　→ 系统 DNS 成功 {stats.FallbackDirectOk}/{attempted}（{rate:0}%）均 {stats.FallbackDirectAvgMs}ms";
     }
 
     private void UpdateTraySpeed(double upRate, double downRate)

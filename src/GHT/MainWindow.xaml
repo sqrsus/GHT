@@ -169,6 +169,9 @@
                     <TextBlock Text="扫描超时(ms)" VerticalAlignment="Center" />
                     <TextBox x:Name="ScanTimeoutBox" Width="60" Margin="6,0,0,0" />
                 </StackPanel>
+                <CheckBox x:Name="FallbackCheck" Content="候选全失败时用系统 DNS 兜底"
+                          ToolTip="加速池解析出的 IP 全部连不上时，再用系统 DNS 试一次；关闭后直接返回 502"
+                          VerticalAlignment="Center" Margin="0,0,18,8" />
                 <CheckBox x:Name="AutoStartCheck" Content="开机自启" VerticalAlignment="Center"
                           Margin="0,0,18,8" />
                 <StackPanel Orientation="Horizontal" Margin="0,0,18,8">
@@ -188,7 +191,7 @@
             </Grid.RowDefinitions>
 
             <TextBlock x:Name="StatsText" Grid.Row="0" TextWrapping="Wrap"
-                       Text="请求 0 · 池胜 0 · 回落 0 · 直连 0 · 隧道 0 · 失败 0" />
+                       Text="请求 0 · 池胜 0 · 池败 0 · 直连 0 · 隧道 0 · 失败 0" />
 
             <WrapPanel Grid.Row="1" Margin="0,6,0,0">
                 <TextBlock Text="日志" VerticalAlignment="Center" />

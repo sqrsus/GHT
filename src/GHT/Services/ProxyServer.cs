@@ -10,6 +10,26 @@ using GHT.Services.Http;
 namespace GHT.Services;
 
 /// <summary>
+/// 加速池选路的结果。<b>必须</b>和「回落原因」分开表达：
+/// 前者描述池子这一侧发生了什么，后者描述上层因此做了什么（回落到系统 DNS，或直接 502）。
+/// 混成一个布尔值的话，「池子没答案」与「预算到期」在统计上就再也分不开了。
+/// </summary>
+public enum PoolOutcome
+{
+    /// <summary>竞速胜出，已拿到连接。</summary>
+    Won,
+
+    /// <summary>首连预算用尽，候选还没凑齐或还没连上。</summary>
+    BudgetExpired,
+
+    /// <summary>首批窗口内加速池一个 IP 都没解析出来。</summary>
+    NoCandidates,
+
+    /// <summary>解析出了候选，但全部建连失败。</summary>
+    CandidatesFailed
+}
+
+/// <summary>
 /// 本地 HTTP 代理（仅监听回环地址）。
 ///
 /// 处理两类请求：
@@ -511,12 +531,19 @@ public sealed class ProxyServer : IAsyncDisposable
 
             // 响应按原始 framing 直接回灌（chunked 保持 chunked），并带空闲超时，
             // 避免上游无视 Connection: close 时把连接吊死。
-            await PumpAsync(upstreamStream, clientStream, ResponseIdleMs, upload: false, token).ConfigureAwait(false);            await clientStream.FlushAsync(token).ConfigureAwait(false);
+            await PumpAsync(upstreamStream, clientStream, ResponseIdleMs, upload: false, token).ConfigureAwait(false);
+            await clientStream.FlushAsync(token).ConfigureAwait(false);
         }
     }
 
     // ── 选路 ────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// 选路：命中白名单 → 加速池解析 + 多 IP 竞速；否则系统 DNS 直连。
+    ///
+    /// 落不到加速池时会明确区分<b>为什么</b>回落（池为空 / 预算到期 / 无解析结果 / 候选全失败），
+    /// 因为这四种情况的修法完全不同，而它们在 UI 上都表现为「回落」。
+    /// </summary>
     private async Task<TcpClient> ConnectForHostAsync(string host, int port, CancellationToken token)
     {
         var settings = _settings;
@@ -529,7 +556,14 @@ public sealed class ProxyServer : IAsyncDisposable
 
         if (!accelerate)
         {
-            return await ConnectDirectAsync(host, port, token).ConfigureAwait(false);
+            return await ConnectDirectAsync(host, port, token, FallbackReason.None).ConfigureAwait(false);
+        }
+
+        // 池为空是「注定要用系统 DNS」的情形：直接连，不必先空转一轮解析再等预算。
+        if (_resolver.PoolCount == 0)
+        {
+            _log.Debug($"加速池为空，{host}:{port} 直接走系统 DNS");
+            return await ConnectDirectAsync(host, port, token, FallbackReason.PoolEmpty).ConfigureAwait(false);
         }
 
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -538,45 +572,59 @@ public sealed class ProxyServer : IAsyncDisposable
             budget.CancelAfter(settings.ConnectBudgetMs);
         }
 
-        TcpClient? client;
-        var exhausted = false;
-
-        try
-        {
-            (client, exhausted) = await ConnectViaPoolAsync(host, port, budget.Token, token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (!token.IsCancellationRequested)
-        {
-            // 预算到点：不是失败，回落系统 DNS，后台扫描继续
-            client = null;
-            exhausted = false;
-        }
+        var (client, outcome) = await ConnectViaPoolAsync(host, port, budget.Token, token).ConfigureAwait(false);
 
         if (client is not null)
         {
             return client;
         }
 
-        if (exhausted)
+        switch (outcome)
         {
-            throw new UpstreamUnavailableException($"{host}:{port} 的全部候选 IP 均连不上");
-        }
+            case PoolOutcome.CandidatesFailed:
+                _statistics.AddPoolLoss();
 
-        _statistics.AddBudgetFallback();
-        _log.Debug($"{host}:{port} 首连预算用尽，回落系统 DNS（后台扫描继续）");
-        return await ConnectDirectAsync(host, port, token).ConfigureAwait(false);
+                if (!settings.FallbackOnCandidatesFailed)
+                {
+                    // 严格语义：候选试完就认失败，不再用系统 DNS 兜底
+                    throw new UpstreamUnavailableException($"{host}:{port} 的全部候选 IP 均连不上");
+                }
+
+                _log.Debug($"{host}:{port} 加速池候选全部连不上，改用系统 DNS 兜底");
+                return await ConnectDirectAsync(host, port, token, FallbackReason.CandidatesFailed)
+                    .ConfigureAwait(false);
+
+            case PoolOutcome.NoCandidates:
+                _log.Debug($"{host}:{port} 加速池暂无解析结果，回落系统 DNS（后台扫描继续）");
+                return await ConnectDirectAsync(host, port, token, FallbackReason.NoDnsAnswer).ConfigureAwait(false);
+
+            default:
+                _log.Debug($"{host}:{port} 首连预算用尽，回落系统 DNS（后台扫描继续）");
+                return await ConnectDirectAsync(host, port, token, FallbackReason.BudgetExpired).ConfigureAwait(false);
+        }
     }
 
-    private async Task<(TcpClient? Client, bool Exhausted)> ConnectViaPoolAsync(
+    private async Task<(TcpClient? Client, PoolOutcome Outcome)> ConnectViaPoolAsync(
         string host,
         int port,
         CancellationToken budgetToken,
         CancellationToken clientToken)
     {
-        var candidates = await _resolver.ResolveAsync(host, budgetToken).ConfigureAwait(false);
+        IReadOnlyList<IPAddress> candidates;
+
+        try
+        {
+            candidates = await _resolver.ResolveAsync(host, budgetToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!clientToken.IsCancellationRequested)
+        {
+            return (null, PoolOutcome.BudgetExpired);
+        }
+
         if (candidates.Count == 0)
         {
-            return (null, false);
+            // 预算已经在等首批结果时被耗尽 → 算预算问题；否则说明池子对这个域名没有答案
+            return (null, budgetToken.IsCancellationRequested ? PoolOutcome.BudgetExpired : PoolOutcome.NoCandidates);
         }
 
         var settings = _settings;
@@ -596,19 +644,23 @@ public sealed class ProxyServer : IAsyncDisposable
 
                 remaining.RemoveRange(0, batch.Count);
 
+                _statistics.AddRace();
+
                 var win = await _racer
                     .RaceAsync(batch, port, settings.RaceConnectTimeoutMs, settings.RaceBatchBudgetMs, budgetToken)
                     .ConfigureAwait(false);
 
                 if (win is { } winner)
                 {
-                    _statistics.AddRace();
                     _statistics.AddPoolWin();
                     _statistics.SetWinner(host, winner.Ip.ToString());
-                    return (winner.Client, false);
+                    return (winner.Client, PoolOutcome.Won);
                 }
 
-                budgetToken.ThrowIfCancellationRequested();
+                if (budgetToken.IsCancellationRequested)
+                {
+                    return (null, PoolOutcome.BudgetExpired);
+                }
             }
 
             if (round >= rounds)
@@ -616,7 +668,14 @@ public sealed class ProxyServer : IAsyncDisposable
                 break;
             }
 
-            await Task.Delay(Math.Clamp(settings.RaceRetryDelayMs, 100, 60_000), budgetToken).ConfigureAwait(false);
+            try
+            {
+                await Task.Delay(Math.Clamp(settings.RaceRetryDelayMs, 100, 60_000), budgetToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return (null, PoolOutcome.BudgetExpired);
+            }
 
             // 后台扫描可能刚好补齐了新 IP，重赛前再取一次缓存
             var refreshed = _resolver.GetCached(host);
@@ -634,14 +693,24 @@ public sealed class ProxyServer : IAsyncDisposable
 
         if (clientToken.IsCancellationRequested)
         {
-            return (null, false);
+            return (null, PoolOutcome.BudgetExpired);
         }
 
-        return (null, true);
+        return (null, PoolOutcome.CandidatesFailed);
     }
 
-    private async Task<TcpClient> ConnectDirectAsync(string host, int port, CancellationToken token)
+    private async Task<TcpClient> ConnectDirectAsync(
+        string host,
+        int port,
+        CancellationToken token,
+        FallbackReason reason)
     {
+        if (reason != FallbackReason.None)
+        {
+            _statistics.AddFallback(reason);
+        }
+
+        var watch = Stopwatch.StartNew();
         var client = new TcpClient();
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -654,17 +723,30 @@ public sealed class ProxyServer : IAsyncDisposable
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
         {
             client.Dispose();
+            NoteFallbackResult(reason, false, watch);
             throw new TimeoutException($"连接 {host}:{port} 超时");
         }
         catch
         {
             client.Dispose();
+            NoteFallbackResult(reason, false, watch);
             throw;
         }
 
         client.NoDelay = true;
         _statistics.AddDirect();
+        NoteFallbackResult(reason, true, watch);
         return client;
+    }
+
+    private void NoteFallbackResult(FallbackReason reason, bool ok, Stopwatch watch)
+    {
+        if (reason == FallbackReason.None)
+        {
+            return;
+        }
+
+        _statistics.AddFallbackResult(ok, (int)watch.ElapsedMilliseconds);
     }
 
     // ── 转发 ────────────────────────────────────────────────────────────

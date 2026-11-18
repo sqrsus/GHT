@@ -1,11 +1,21 @@
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using GHT.Models;
 using GHT.Services.Dns;
 
 namespace GHT.Services;
+
+/// <summary>
+/// DNS 查询委托。生产环境固定是 <c>UdpDnsClient.QueryAsync</c>；
+/// 测试用它可以精确控制「哪台 DNS 慢、慢多久」，从而验证首批窗口是否真的是时间窗口。
+/// </summary>
+internal delegate Task<DnsQueryResult?> DnsQueryHandler(
+    IPAddress server,
+    string host,
+    int timeoutMs,
+    CancellationToken cancellationToken,
+    bool ipv6);
 
 /// <summary>
 /// 解析中枢：把「加速池里的公共 DNS」变成「某个域名的候选 IP 列表」。
@@ -15,17 +25,29 @@ namespace GHT.Services;
 ///    扫描仍会继续并把结果写进缓存——下一次请求就能直接命中。
 /// 2) 缓存渐进补充：每解析出一批 IP 就合并进缓存，因此不存在「等全池扫完才有结果」。
 /// 3) 加速池为空时返回空列表（而不是抛异常），由上层回落到系统 DNS。
+/// 4) 首批发布是<b>真正的时间窗口</b>：由「任一查询完成」或「独立截止计时器」触发，
+///    不依赖某一批 <c>Task.WhenAll</c> 结束。旧实现要等整批 DNS 都返回才检查窗口，
+///    只要批里有一台慢，首批就被拖到单次 DNS 超时附近，把整个首连预算吃掉。
 /// </summary>
 public sealed class ResolverHub
 {
+    /// <summary>首批最多问多少台 DNS。收益来自「尽快拿到几个可用 IP」，不是把整池问完。</summary>
+    private const int FirstBatchServerCap = 32;
+
+    /// <summary>后台补齐的目标候选数。到量即停，避免为一个域名把上千台 DNS 全问一遍。</summary>
+    private const int BackgroundTargetIps = 16;
+
     private readonly LogService _log;
+    private readonly DnsQueryHandler _query;
     private readonly DnsResultCache _cache = new();
-    private readonly ConcurrentDictionary<string, Task<IReadOnlyList<IPAddress>>> _sweeps =
+
+    private readonly ConcurrentDictionary<string, Lazy<Task<IReadOnlyList<IPAddress>>>> _sweeps =
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// 每台公共 DNS 在运行期的命中/失败计数。UI 用它在加速池里显示「健康 / 降级 / 失效」，
     /// 否则用户只能看到一个扫描时的静态延迟，无法判断这台 DNS 现在还灵不灵。
+    /// 首批也会用它把「失败多于成功」的服务器排到后面。
     /// </summary>
     private readonly ConcurrentDictionary<string, ServerHealth> _serverHealth =
         new(StringComparer.OrdinalIgnoreCase);
@@ -45,8 +67,16 @@ public sealed class ResolverHub
     private long _cacheHits;
 
     public ResolverHub(AppSettings settings, LogService log)
+        : this(settings, log, null)
+    {
+    }
+
+    /// <summary>测试构造：注入查询委托，以便控制单台 DNS 的响应时间。</summary>
+    internal ResolverHub(AppSettings settings, LogService log, DnsQueryHandler? query)
     {
         _log = log;
+        _query = query ?? UdpDnsClient.QueryAsync;
+
         UpdatePool(settings.DnsPool);
         ApplySettings(settings);
     }
@@ -122,20 +152,37 @@ public sealed class ResolverHub
 
         if (_sweeps.TryGetValue(host, out var tracked))
         {
-            if (tracked.IsCompleted)
+            if (tracked.Value.IsCompleted)
             {
-                _sweeps.TryRemove(host, out _);
+                RemoveSweep(host, tracked);
             }
             else
             {
-                sweep = tracked;
+                sweep = tracked.Value;
             }
         }
 
-        sweep ??= _sweeps.GetOrAdd(host, StartSweep);
+        sweep ??= _sweeps.GetOrAdd(host, CreateSweep).Value;
 
         return await sweep.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// 按 key + value 精确移除。并发下另一个调用可能刚把「新任务」放进字典，
+    /// 此时 <c>TryRemove(host)</c> 会把新任务删掉，导致短时间内重复启动扫描。
+    /// </summary>
+    private void RemoveSweep(string host, Lazy<Task<IReadOnlyList<IPAddress>>> tracked)
+    {
+        var collection = (ICollection<KeyValuePair<string, Lazy<Task<IReadOnlyList<IPAddress>>>>>)_sweeps;
+        collection.Remove(new KeyValuePair<string, Lazy<Task<IReadOnlyList<IPAddress>>>>(host, tracked));
+    }
+
+    /// <summary>
+    /// 用 <see cref="Lazy{T}"/> 包一层再放进字典：<c>GetOrAdd</c> 的工厂在高并发下可能被调用多次
+    /// （只有一份会被保留），如果工厂本身带「启动扫描」的副作用，那些被丢弃的调用就会白扫一遍。
+    /// </summary>
+    private Lazy<Task<IReadOnlyList<IPAddress>>> CreateSweep(string host) =>
+        new(() => StartSweep(host), LazyThreadSafetyMode.ExecutionAndPublication);
 
     private Task<IReadOnlyList<IPAddress>> StartSweep(string host)
     {
@@ -143,7 +190,10 @@ public sealed class ResolverHub
             TaskCreationOptions.RunContinuationsAsynchronously);
 
         var generation = Volatile.Read(ref _generation);
-        _ = Task.Run(() => SweepAsync(host, firstBatch, generation), CancellationToken.None);
+
+        // 直接启动异步方法：首个 await 前只有建 socket 这类极短的同步工作。
+        // 旧实现用 Task.Run 包一层，调用方本身在池线程时还要再排一次队，白白推迟首批结果。
+        _ = SweepAsync(host, firstBatch, generation);
 
         return firstBatch.Task;
     }
@@ -153,77 +203,174 @@ public sealed class ResolverHub
         TaskCompletionSource<IReadOnlyList<IPAddress>> firstBatch,
         int generation)
     {
-        try
+        var pool = _pool;
+        if (pool.Count == 0)
         {
-            var pool = _pool;
-            if (pool.Count == 0)
+            _log.Debug($"加速池为空，{host} 直接走系统 DNS");
+            firstBatch.TrySetResult(Array.Empty<IPAddress>());
+            return;
+        }
+
+        var found = new List<IPAddress>(16);
+        var seen = new HashSet<IPAddress>();
+        var published = 0;
+
+        var window = Math.Max(0, _firstBatchMs);
+
+        // window == 0 表示「不聚合」：拿到第一个答案就返回，但也不能在还没有答案时抢先发布空结果。
+        var minIps = window <= 0 ? 1 : Math.Max(1, _firstBatchMinIps);
+
+        // 发布只由两件事触发：任一查询完成（凑够 minIps）、或独立截止计时器到点。
+        void TryPublish(bool force)
+        {
+            if (Volatile.Read(ref published) != 0)
             {
-                _log.Warn($"加速池为空，{host} 将直接走系统 DNS");
-                firstBatch.TrySetResult(Array.Empty<IPAddress>());
                 return;
             }
 
-            var found = new List<IPAddress>(16);
-            var seen = new HashSet<IPAddress>();
-            var stopwatch = Stopwatch.StartNew();
+            IPAddress[] snapshot;
 
-            var window = Math.Max(0, _firstBatchMs);
-            var minIps = Math.Max(1, _firstBatchMinIps);
-
-            // 硬停阈值：攒够 8 个就不再继续问剩下的 DNS（首连不需要穷举整池）。
-            var enoughToStop = Math.Max(minIps, 8);
-            var concurrency = Math.Max(1, _concurrency);
-
-            var index = 0;
-            var returned = false;
-
-            using var guard = new CancellationTokenSource(
-                TimeSpan.FromMilliseconds(Math.Max(4000, _timeoutMs * 8)));
-
-            while (index < pool.Count)
+            lock (found)
             {
-                if (generation != Volatile.Read(ref _generation))
+                if (!force && found.Count < minIps)
                 {
-                    // 池在扫描过程中被替换，本轮结果已无意义
-                    firstBatch.TrySetResult(Array.Empty<IPAddress>());
                     return;
                 }
 
-                var chunk = new List<DnsPoolEntry>(concurrency);
-                for (var i = 0; i < concurrency && index < pool.Count; i++)
-                {
-                    chunk.Add(pool[index++]);
-                }
-
-                await Task.WhenAll(
-                        chunk.Select(entry => QueryOneAsync(entry, host, found, seen, generation, guard.Token)))
-                    .ConfigureAwait(false);
-
-                int count;
-                lock (found)
-                {
-                    count = found.Count;
-                }
-
-                if (!returned && (count >= minIps || stopwatch.ElapsedMilliseconds >= window))
-                {
-                    returned = true;
-                    firstBatch.TrySetResult(Snapshot(found));
-                }
-
-                if (count >= enoughToStop || stopwatch.ElapsedMilliseconds > 15_000)
-                {
-                    break;
-                }
+                snapshot = found.ToArray();
             }
 
-            firstBatch.TrySetResult(Snapshot(found));
+            if (Interlocked.Exchange(ref published, 1) == 0)
+            {
+                firstBatch.TrySetResult(snapshot);
+            }
+        }
+
+        using var deadline = new CancellationTokenSource();
+        var deadlineTask = window > 0
+            ? PublishOnDeadlineAsync(window, () => TryPublish(force: true), deadline.Token)
+            : Task.CompletedTask;
+
+        using var guard = new CancellationTokenSource(TimeSpan.FromMilliseconds(Math.Max(4000, _timeoutMs * 8)));
+
+        try
+        {
+            var ordered = OrderByHealth(pool);
+
+            // 首批只问「延迟低、近期成功率高」的前若干台，其余留给后台。
+            var headCount = Math.Min(ordered.Count, Math.Clamp(Math.Max(minIps * 2, 8), 8, FirstBatchServerCap));
+
+            var head = new Task[headCount];
+            for (var i = 0; i < headCount; i++)
+            {
+                head[i] = QueryOneAsync(
+                    ordered[i],
+                    host,
+                    found,
+                    seen,
+                    generation,
+                    () => TryPublish(force: false),
+                    guard.Token);
+            }
+
+            await Task.WhenAll(head).ConfigureAwait(false);
+
+            // 这里刻意<b>不</b>急着发布空结果：首批没答案不代表池子没答案，
+            // 后面还有服务器没问。收口交给截止计时器（窗口）或整轮扫描结束，
+            // 否则会把「后面几台能答」的池子直接判死，白白回落系统 DNS。
+            if (headCount < ordered.Count)
+            {
+                await DrainAsync(ordered, headCount, host, found, seen, generation, guard.Token).ConfigureAwait(false);
+            }
         }
         catch (Exception ex)
         {
             _log.Warn($"解析 {host} 失败：{ex.GetType().Name}: {ex.Message}");
-            firstBatch.TrySetResult(Array.Empty<IPAddress>());
         }
+        finally
+        {
+            TryPublish(force: true);
+
+            try
+            {
+                deadline.Cancel();
+                await deadlineTask.ConfigureAwait(false);
+            }
+            catch
+            {
+                // 截止计时器随扫描结束而取消，属正常路径
+            }
+        }
+    }
+
+    /// <summary>
+    /// 后台补齐：固定数量 worker 从剩余服务器里取活，只写缓存与候选表，不影响任何等待者。
+    /// </summary>
+    private async Task DrainAsync(
+        IReadOnlyList<DnsPoolEntry> ordered,
+        int startIndex,
+        string host,
+        List<IPAddress> found,
+        HashSet<IPAddress> seen,
+        int generation,
+        CancellationToken token)
+    {
+        var workers = Math.Min(Math.Max(1, _concurrency), ordered.Count - startIndex);
+
+        // 用单元素数组做游标：局部变量在 async 里被提升为状态机字段，ref 取址容易踩编译器边角
+        var cursor = new[] { startIndex - 1 };
+
+        async Task WorkerAsync()
+        {
+            while (true)
+            {
+                if (token.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                var index = Interlocked.Increment(ref cursor[0]);
+                if (index >= ordered.Count)
+                {
+                    return;
+                }
+
+                if (generation != Volatile.Read(ref _generation))
+                {
+                    // 池已换过，本轮结果无意义
+                    return;
+                }
+
+                if (CountFound(found) >= BackgroundTargetIps)
+                {
+                    return;
+                }
+
+                await QueryOneAsync(ordered[index], host, found, seen, generation, null, token).ConfigureAwait(false);
+            }
+        }
+
+        var tasks = new Task[workers];
+        for (var i = 0; i < workers; i++)
+        {
+            tasks[i] = WorkerAsync();
+        }
+
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+    }
+
+    private static async Task PublishOnDeadlineAsync(int windowMs, Action publish, CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(windowMs, token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        publish();
     }
 
     private async Task QueryOneAsync(
@@ -232,6 +379,7 @@ public sealed class ResolverHub
         List<IPAddress> found,
         HashSet<IPAddress> seen,
         int generation,
+        Action? onResult,
         CancellationToken token)
     {
         if (!IPAddress.TryParse(entry.Ip, out var server))
@@ -239,11 +387,30 @@ public sealed class ResolverHub
             return;
         }
 
-        // A 与 AAAA 同时问：纯 IPv6 环境下只查 A 会得到空答案，候选池直接少一半路子。
-        var answers = await Task.WhenAll(
-                UdpDnsClient.QueryAsync(server, host, _timeoutMs, token),
-                UdpDnsClient.QueryAsync(server, host, _timeoutMs, token, ipv6: true))
-            .ConfigureAwait(false);
+        DnsQueryResult?[] answers;
+
+        try
+        {
+            // A 与 AAAA 同时问：纯 IPv6 环境下只查 A 会得到空答案，候选池直接少一半路子。
+            var queries = new[]
+            {
+                _query(server, host, _timeoutMs, token, false),
+                _query(server, host, _timeoutMs, token, true)
+            };
+
+            answers = await Task.WhenAll(queries).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // 后台扫描被守卫超时取消：不是这台 DNS 的错，不计入健康度
+            return;
+        }
+        catch (Exception ex)
+        {
+            RecordHealth(entry.Ip, false);
+            _log.Debug($"{entry.Ip} 解析 {host} 失败：{ex.GetType().Name}");
+            return;
+        }
 
         if (generation != Volatile.Read(ref _generation))
         {
@@ -269,6 +436,8 @@ public sealed class ResolverHub
 
             hit = true;
             addresses.AddRange(result.Addresses);
+
+            // 一次合并内的 TTL 取最小值：宁可早一点重新解析，也不要把快过期的地址留太久
             ttl = Math.Min(ttl, Math.Clamp(result.TtlSeconds, _minTtl, _maxTtl));
         }
 
@@ -282,6 +451,8 @@ public sealed class ResolverHub
 
         _cache.Merge(host, addresses, ttl, _preferIpv4);
 
+        var added = false;
+
         lock (found)
         {
             foreach (var address in addresses)
@@ -289,11 +460,70 @@ public sealed class ResolverHub
                 if (seen.Add(address))
                 {
                     found.Add(address);
+                    added = true;
                 }
             }
 
-            found.Sort(CompareAddress);
+            if (added)
+            {
+                found.Sort(CompareAddress);
+            }
         }
+
+        if (added)
+        {
+            onResult?.Invoke();
+        }
+    }
+
+    /// <summary>
+    /// 首批排序：失败多于成功的排后面，其余按扫描时的延迟升序。
+    /// 不直接按「失败次数」排 —— 那个计数器是累加的，一次历史失败会让一台好 DNS 永远靠后。
+    /// </summary>
+    private List<DnsPoolEntry> OrderByHealth(IReadOnlyList<DnsPoolEntry> pool)
+    {
+        if (pool.Count <= 1)
+        {
+            return new List<DnsPoolEntry>(pool);
+        }
+
+        var scored = new List<(DnsPoolEntry Entry, int Index, int Degraded, int Latency)>(pool.Count);
+
+        for (var i = 0; i < pool.Count; i++)
+        {
+            var entry = pool[i];
+            var degraded = 0;
+
+            if (_serverHealth.TryGetValue(entry.Ip, out var health))
+            {
+                degraded = Volatile.Read(ref health.Fail) > Volatile.Read(ref health.Ok) ? 1 : 0;
+            }
+
+            scored.Add((entry, i, degraded, entry.LatencyMs));
+        }
+
+        scored.Sort((left, right) =>
+        {
+            if (left.Degraded != right.Degraded)
+            {
+                return left.Degraded.CompareTo(right.Degraded);
+            }
+
+            if (left.Latency != right.Latency)
+            {
+                return left.Latency.CompareTo(right.Latency);
+            }
+
+            return left.Index.CompareTo(right.Index);
+        });
+
+        var ordered = new List<DnsPoolEntry>(pool.Count);
+        foreach (var item in scored)
+        {
+            ordered.Add(item.Entry);
+        }
+
+        return ordered;
     }
 
     private void RecordHealth(string ip, bool ok)
@@ -310,11 +540,11 @@ public sealed class ResolverHub
         }
     }
 
-    private static IReadOnlyList<IPAddress> Snapshot(List<IPAddress> found)
+    private static int CountFound(List<IPAddress> found)
     {
         lock (found)
         {
-            return found.ToArray();
+            return found.Count;
         }
     }
 

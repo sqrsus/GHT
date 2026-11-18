@@ -99,4 +99,63 @@ public sealed class DnsResultCacheTests
 
         Assert.Equal(0, cache.Count);
     }
+
+    [Fact]
+    public void Short_ttl_address_expires_while_long_ttl_address_stays()
+    {
+        // 旧实现整条缓存只存一个过期时刻且取最大值：短 TTL 的地址会跟着长 TTL 一起活下去
+        var clock = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var cache = new DnsResultCache(() => clock);
+
+        cache.Merge("github.com", new[] { Ip("1.1.1.1") }, 30, preferIpv4: true);
+
+        clock = clock.AddSeconds(20);
+        cache.Merge("github.com", new[] { Ip("2.2.2.2") }, 600, preferIpv4: true);
+
+        // t=35：第一个地址（30s）已过期，第二个还有 585s
+        clock = clock.AddSeconds(15);
+        var alive = cache.Get("github.com");
+
+        Assert.NotNull(alive);
+        Assert.Single(alive!);
+        Assert.Equal(Ip("2.2.2.2"), alive![0]);
+
+        // t=635：第二个也过期了
+        clock = clock.AddSeconds(600);
+        Assert.Null(cache.Get("github.com"));
+    }
+
+    [Fact]
+    public void Re_confirmed_address_restarts_its_ttl()
+    {
+        var clock = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var cache = new DnsResultCache(() => clock);
+
+        cache.Merge("github.com", new[] { Ip("1.1.1.1") }, 60, preferIpv4: true);
+
+        clock = clock.AddSeconds(50);
+        cache.Merge("github.com", new[] { Ip("1.1.1.1") }, 60, preferIpv4: true);
+
+        // 距第一次 80s（本该过期），距第二次只有 30s
+        clock = clock.AddSeconds(30);
+        Assert.NotNull(cache.Get("github.com"));
+    }
+
+    [Fact]
+    public void Expired_address_is_dropped_without_losing_the_valid_ones()
+    {
+        var clock = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var cache = new DnsResultCache(() => clock);
+
+        cache.Merge("github.com", new[] { Ip("1.1.1.1") }, 10, preferIpv4: true);
+        clock = clock.AddSeconds(5);
+        cache.Merge("github.com", new[] { Ip("2.2.2.2") }, 600, preferIpv4: true);
+
+        clock = clock.AddSeconds(20);
+
+        var alive = cache.Get("github.com");
+        Assert.NotNull(alive);
+        Assert.DoesNotContain(alive!, a => a.Equals(Ip("1.1.1.1")));
+        Assert.Contains(alive!, a => a.Equals(Ip("2.2.2.2")));
+    }
 }

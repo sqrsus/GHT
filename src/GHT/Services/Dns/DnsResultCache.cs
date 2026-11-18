@@ -12,13 +12,18 @@ namespace GHT.Services.Dns;
 /// 读者拿到数组后直接使用。旧实现每次读取都要进全局锁并 <c>ToArray()</c> 复制一遍，
 /// 高并发下这里是最热的一处竞争点。
 ///
-/// 去重改用 <see cref="IPAddress"/> 相等语义（按地址族 + 字节比较），不再走 <c>ToString()</c>，
-/// 既省掉每次合并的字符串分配，也避免把 <c>::ffff:a.b.c.d</c> 与 <c>a.b.c.d</c> 混为一谈。
+/// TTL 语义：<b>每个地址各自记过期时刻</b>。旧实现整条缓存只存一个过期时刻并取「最大值」，
+/// 于是「A 的记录 TTL=60s、B 的记录 TTL=600s」时，A 会在 60s 后仍被当成有效地址使用，
+/// 最多能滞留到 600s。现在合并时：新出现的地址按本次 TTL 从当前时刻计时，
+/// 已被 DNS 再次确认的地址顺延，没被确认的保留原到期时刻，读时逐个剔除。
 /// </summary>
 public sealed class DnsResultCache
 {
     /// <summary>条目上限。超过后顺手清掉已过期的条目，防止长期运行无限增长。</summary>
     private const int MaxEntries = 512;
+
+    /// <summary>TTL 下限：低于 5 秒的结果没有缓存价值，还会把扫描频率放大。</summary>
+    private const int MinTtlSeconds = 5;
 
     private sealed class Entry
     {
@@ -27,11 +32,23 @@ public sealed class DnsResultCache
 
         public IPAddress[] Addresses = Array.Empty<IPAddress>();
 
-        /// <summary>绝对过期时刻（UTC ticks），0 表示尚未写入。</summary>
-        public long ExpiresAtTicks;
+        /// <summary>与 <see cref="Addresses"/> 一一对应的过期时刻（UTC ticks）。</summary>
+        public long[] ExpiresAtTicks = Array.Empty<long>();
+
+        /// <summary>所有地址里最早的那个过期时刻。读路径先看它，未过期就完全不加锁。</summary>
+        public long MinExpiresAtTicks;
     }
 
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Func<DateTimeOffset> _clock;
+
+    public DnsResultCache()
+        : this(null)
+    {
+    }
+
+    /// <summary>测试构造：注入可控时钟，用来验证「不同 TTL 的地址各自过期」。</summary>
+    internal DnsResultCache(Func<DateTimeOffset>? clock) => _clock = clock ?? (() => DateTimeOffset.UtcNow);
 
     public int Count => _entries.Count;
 
@@ -50,13 +67,19 @@ public sealed class DnsResultCache
             return null;
         }
 
-        var expiry = Volatile.Read(ref entry.ExpiresAtTicks);
-        if (expiry == 0 || expiry <= DateTimeOffset.UtcNow.Ticks)
+        var now = NowTicks();
+        if (now < Volatile.Read(ref entry.MinExpiresAtTicks))
         {
-            return null;
+            return addresses;
         }
 
-        return addresses;
+        // 有条目过期（每个 TTL 周期才会走到这里一次）：只剔除过期的那几个地址，
+        // 不能因为「有一个过期」就把整批仍然有效的候选一起丢掉。
+        lock (entry.Gate)
+        {
+            var alive = PruneLocked(entry, now);
+            return alive.Length == 0 ? null : alive;
+        }
     }
 
     public void Merge(string host, IEnumerable<IPAddress> addresses, int ttlSeconds, bool preferIpv4)
@@ -68,38 +91,71 @@ public sealed class DnsResultCache
         }
 
         var entry = _entries.GetOrAdd(host, _ => new Entry());
+        var now = NowTicks();
+        var expiresAt = now + TimeSpan.FromSeconds(Math.Max(MinTtlSeconds, ttlSeconds)).Ticks;
 
         lock (entry.Gate)
         {
             var current = entry.Addresses;
+            var currentExpiry = entry.ExpiresAtTicks;
 
-            // 先用现有集合判重，只有真的出现新地址时才分配新数组并排序
-            var set = new HashSet<IPAddress>(current);
-            var added = 0;
+            // 地址 → 过期时刻。已过期的旧地址不再搬进新表，顺手完成一次清理。
+            var merged = new Dictionary<IPAddress, long>(current.Length + incoming.Length);
 
-            foreach (var address in incoming)
+            for (var i = 0; i < current.Length; i++)
             {
-                if (address is not null && set.Add(address))
+                if (currentExpiry[i] > now)
                 {
-                    added++;
+                    merged[current[i]] = currentExpiry[i];
                 }
             }
 
-            if (added > 0)
-            {
-                var merged = new IPAddress[set.Count];
-                set.CopyTo(merged);
-                Array.Sort(merged, (left, right) => CompareAddress(left, right, preferIpv4));
+            var changed = false;
 
-                // 整体替换引用：读者要么看到旧的完整数组，要么看到新的完整数组，不会看到半个
-                Volatile.Write(ref entry.Addresses, merged);
+            foreach (var address in incoming)
+            {
+                if (address is null)
+                {
+                    continue;
+                }
+
+                // 刚被 DNS 确认过一次：TTL 从此刻重新计时，而不是在旧值与新值之间取 max/min 去猜
+                merged[address] = expiresAt;
+                changed = true;
             }
 
-            var expiry = DateTimeOffset.UtcNow.AddSeconds(Math.Max(5, ttlSeconds)).Ticks;
-            if (expiry > Volatile.Read(ref entry.ExpiresAtTicks))
+            if (!changed)
             {
-                Volatile.Write(ref entry.ExpiresAtTicks, expiry);
+                return;
             }
+
+            var nextAddresses = new IPAddress[merged.Count];
+            var nextExpiry = new long[merged.Count];
+            var cursor = 0;
+            var min = long.MaxValue;
+
+            foreach (var pair in merged)
+            {
+                nextAddresses[cursor] = pair.Key;
+                nextExpiry[cursor] = pair.Value;
+
+                if (pair.Value < min)
+                {
+                    min = pair.Value;
+                }
+
+                cursor++;
+            }
+
+            Array.Sort(
+                nextAddresses,
+                nextExpiry,
+                Comparer<IPAddress>.Create((left, right) => CompareAddress(left, right, preferIpv4)));
+
+            // 整体替换引用：读者要么看到旧的完整数组，要么看到新的完整数组，不会看到半个
+            Volatile.Write(ref entry.ExpiresAtTicks, nextExpiry);
+            Volatile.Write(ref entry.Addresses, nextAddresses);
+            Volatile.Write(ref entry.MinExpiresAtTicks, min);
         }
 
         PruneIfNeeded();
@@ -114,6 +170,58 @@ public sealed class DnsResultCache
     /// <summary>删除单个域名的缓存（诊断面板里手动重查时用）。</summary>
     public bool Remove(string host) => _entries.TryRemove(host, out _);
 
+    private long NowTicks() => _clock().UtcDateTime.Ticks;
+
+    /// <summary>在条目锁内剔除已过期地址，并把新数组发布出去。返回仍然有效的地址。</summary>
+    private static IPAddress[] PruneLocked(Entry entry, long now)
+    {
+        var addresses = entry.Addresses;
+        var expiry = entry.ExpiresAtTicks;
+
+        var alive = 0;
+        for (var i = 0; i < addresses.Length && i < expiry.Length; i++)
+        {
+            if (expiry[i] > now)
+            {
+                alive++;
+            }
+        }
+
+        if (alive == addresses.Length)
+        {
+            return addresses;
+        }
+
+        var nextAddresses = new IPAddress[alive];
+        var nextExpiry = new long[alive];
+        var cursor = 0;
+        var min = long.MaxValue;
+
+        for (var i = 0; i < addresses.Length && i < expiry.Length; i++)
+        {
+            if (expiry[i] <= now)
+            {
+                continue;
+            }
+
+            nextAddresses[cursor] = addresses[i];
+            nextExpiry[cursor] = expiry[i];
+
+            if (expiry[i] < min)
+            {
+                min = expiry[i];
+            }
+
+            cursor++;
+        }
+
+        Volatile.Write(ref entry.ExpiresAtTicks, nextExpiry);
+        Volatile.Write(ref entry.Addresses, nextAddresses);
+        Volatile.Write(ref entry.MinExpiresAtTicks, min == long.MaxValue ? 0 : min);
+
+        return nextAddresses;
+    }
+
     private void PruneIfNeeded()
     {
         if (_entries.Count <= MaxEntries)
@@ -121,15 +229,19 @@ public sealed class DnsResultCache
             return;
         }
 
-        var now = DateTimeOffset.UtcNow.Ticks;
+        var now = NowTicks();
 
         foreach (var pair in _entries)
         {
-            var expiry = Volatile.Read(ref pair.Value.ExpiresAtTicks);
-            if (expiry == 0 || expiry <= now)
+            var min = Volatile.Read(ref pair.Value.MinExpiresAtTicks);
+            if (min != 0 && min > now)
             {
-                _entries.TryRemove(pair.Key, out _);
+                continue;
             }
+
+            // 按 key+value 精确移除：并发合并可能刚把同一个 key 换成新条目，直接 TryRemove(key) 会误删
+            var collection = (ICollection<KeyValuePair<string, Entry>>)_entries;
+            collection.Remove(pair);
         }
     }
 

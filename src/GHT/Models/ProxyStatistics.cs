@@ -1,9 +1,35 @@
 namespace GHT.Models;
 
 /// <summary>
+/// 为什么会回落到系统 DNS。这四种情况的成因和修法完全不同，混成一个「回落」计数会掩盖真实问题：
+/// 池为空要先去扫描；预算到期要看 DNS 响应慢不慢；没答案说明这批 DNS 对该域名的解析不一致；
+/// 候选全失败说明解析出来的 IP 本身连不上。
+/// </summary>
+public enum FallbackReason
+{
+    /// <summary>没有回落（正常直连，或加速池选路成功）。</summary>
+    None,
+
+    /// <summary>加速池为空，注定要走系统 DNS。</summary>
+    PoolEmpty,
+
+    /// <summary>首连预算用尽，还没等到可用候选。</summary>
+    BudgetExpired,
+
+    /// <summary>首批窗口内加速池一个 IP 都没解析出来。</summary>
+    NoDnsAnswer,
+
+    /// <summary>解析出了候选，但全部建连失败。</summary>
+    CandidatesFailed
+}
+
+/// <summary>
 /// 代理运行期计数器（无锁自增，UI 每秒采样一次）。
-/// 分开展示「池胜 / 预算回落 / 直连」是判断加速是否真的生效的唯一凭据：
+/// 分开展示「池胜 / 回落 / 直连」是判断加速是否真的生效的唯一凭据：
 /// 只有「池胜」占比高，才说明加速池与竞速在起作用，而不是一直在偷偷走系统 DNS。
+///
+/// 回落再按原因拆分，并单独统计「回落之后系统 DNS 是否连得上、花了多久」——
+/// 否则只能看到「回落变多了」，无法判断是预算太紧、池子太差，还是系统 DNS 也不通。
 ///
 /// 另外记录字节数与首连耗时分布：没有这两个量，「加速到底快了多少」只能靠感觉。
 /// 首连耗时用固定长度的环形缓冲（不累积全量历史），避免长时间运行后内存无限增长。
@@ -17,7 +43,14 @@ public sealed class ProxyStatistics
     private long _tunnels;
     private long _errors;
     private long _poolWins;
-    private long _budgetFallbacks;
+    private long _poolLosses;
+    private long _fallbackBudget;
+    private long _fallbackPoolEmpty;
+    private long _fallbackNoAnswer;
+    private long _fallbackCandidates;
+    private long _fallbackDirectOk;
+    private long _fallbackDirectFail;
+    private long _fallbackDirectMsTotal;
     private long _directConnects;
     private long _bytesUp;
     private long _bytesDown;
@@ -43,10 +76,51 @@ public sealed class ProxyStatistics
     /// <summary>加速池竞速选路成功。</summary>
     public void AddPoolWin() => Interlocked.Increment(ref _poolWins);
 
-    /// <summary>首连预算耗尽，先回落系统 DNS（后台扫描仍在继续）。</summary>
-    public void AddBudgetFallback() => Interlocked.Increment(ref _budgetFallbacks);
+    /// <summary>加速池的候选全部建连失败（无论随后是否兜底到系统 DNS）。</summary>
+    public void AddPoolLoss() => Interlocked.Increment(ref _poolLosses);
 
-    /// <summary>直接使用系统 DNS 建连（不命中白名单，或预算/候选耗尽后的回落）。</summary>
+    /// <summary>记一次系统 DNS 回落，按原因分项累计。</summary>
+    public void AddFallback(FallbackReason reason)
+    {
+        switch (reason)
+        {
+            case FallbackReason.PoolEmpty:
+                Interlocked.Increment(ref _fallbackPoolEmpty);
+                break;
+            case FallbackReason.BudgetExpired:
+                Interlocked.Increment(ref _fallbackBudget);
+                break;
+            case FallbackReason.NoDnsAnswer:
+                Interlocked.Increment(ref _fallbackNoAnswer);
+                break;
+            case FallbackReason.CandidatesFailed:
+                Interlocked.Increment(ref _fallbackCandidates);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// 回落之后系统 DNS 这次建连的结果与耗时。
+    /// 「回落成功率」是判断该不该继续保留回落策略的唯一依据，必须能单独看到。
+    /// </summary>
+    public void AddFallbackResult(bool ok, int milliseconds)
+    {
+        if (ok)
+        {
+            Interlocked.Increment(ref _fallbackDirectOk);
+        }
+        else
+        {
+            Interlocked.Increment(ref _fallbackDirectFail);
+        }
+
+        if (milliseconds > 0)
+        {
+            Interlocked.Add(ref _fallbackDirectMsTotal, milliseconds);
+        }
+    }
+
+    /// <summary>直接使用系统 DNS 建连成功（不命中白名单，或回落后的直连）。</summary>
     public void AddDirect() => Interlocked.Increment(ref _directConnects);
 
     /// <summary>隧道建立（活跃数 +1）。</summary>
@@ -125,13 +199,25 @@ public sealed class ProxyStatistics
 
         var samples = TakeSamples();
 
+        var fallbackOk = Interlocked.Read(ref _fallbackDirectOk);
+        var fallbackFail = Interlocked.Read(ref _fallbackDirectFail);
+        var fallbackCount = fallbackOk + fallbackFail;
+        var fallbackTotalMs = Interlocked.Read(ref _fallbackDirectMsTotal);
+
         return new ProxyStatsSnapshot(
             Interlocked.Read(ref _requests),
             Interlocked.Read(ref _races),
             Interlocked.Read(ref _tunnels),
             Interlocked.Read(ref _errors),
             Interlocked.Read(ref _poolWins),
-            Interlocked.Read(ref _budgetFallbacks),
+            Interlocked.Read(ref _poolLosses),
+            Interlocked.Read(ref _fallbackBudget),
+            Interlocked.Read(ref _fallbackPoolEmpty),
+            Interlocked.Read(ref _fallbackNoAnswer),
+            Interlocked.Read(ref _fallbackCandidates),
+            fallbackOk,
+            fallbackFail,
+            fallbackCount == 0 ? 0 : (int)(fallbackTotalMs / fallbackCount),
             Interlocked.Read(ref _directConnects),
             Interlocked.Read(ref _bytesUp),
             Interlocked.Read(ref _bytesDown),
@@ -177,7 +263,14 @@ public readonly record struct ProxyStatsSnapshot(
     long Tunnels,
     long Errors,
     long PoolWins,
-    long BudgetFallbacks,
+    long PoolLosses,
+    long FallbackBudget,
+    long FallbackPoolEmpty,
+    long FallbackNoAnswer,
+    long FallbackCandidates,
+    long FallbackDirectOk,
+    long FallbackDirectFail,
+    int FallbackDirectAvgMs,
     long DirectConnects,
     long BytesUp,
     long BytesDown,
@@ -186,4 +279,18 @@ public readonly record struct ProxyStatsSnapshot(
     int ConnectP95Ms,
     int ConnectAvgMs,
     string LastWinner,
-    string LastFailure);
+    string LastFailure)
+{
+    /// <summary>所有回落原因之和。</summary>
+    public long Fallbacks => FallbackBudget + FallbackPoolEmpty + FallbackNoAnswer + FallbackCandidates;
+
+    /// <summary>回落之后系统 DNS 的成功率（0~1，没有回落时为 0）。</summary>
+    public double FallbackSuccessRate
+    {
+        get
+        {
+            var total = FallbackDirectOk + FallbackDirectFail;
+            return total == 0 ? 0 : (double)FallbackDirectOk / total;
+        }
+    }
+}

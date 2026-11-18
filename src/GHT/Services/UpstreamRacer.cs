@@ -173,17 +173,9 @@ public sealed class UpstreamRacer
 
         try
         {
-            // 隧道要跑满带宽，默认 64KB 的套接字缓冲在长肥管道上会限制吞吐；失败也不影响功能。
-            try
-            {
-                client.SendBufferSize = 256 * 1024;
-                client.ReceiveBufferSize = 256 * 1024;
-            }
-            catch
-            {
-                // 部分平台/策略下不允许改，忽略
-            }
-
+            // 这里刻意<b>不</b>调整套接字缓冲：竞速时可能有 8 个候选同时建连，
+            // 给每个都设 256KB 等于把内核缓冲成本乘以候选数，而落败者在几十毫秒内就被释放。
+            // 调大缓冲放在胜出之后做（ProxyServer.TuneSocket），只对真正跑流量的那一条生效。
             await client.ConnectAsync(address, port, token).ConfigureAwait(false);
             client.NoDelay = true;
             stopwatch.Stop();

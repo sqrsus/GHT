@@ -42,11 +42,12 @@ GHT 是一个 Windows 桌面小工具：在本机开一个 HTTP 代理，**只�
    数据双向转发（60s 空闲超时，半关闭语义保留）
 ```
 
-三条关键设计：
+四条关键设计：
 
 1. **首连预算（默认 1500ms）只包住「选路」**，不包住数据转发。预算到点就先用系统 DNS 连上，DNS 扫描在后台继续，下一个请求即可命中新结果——不会出现「明明能直连却报 502」，也不会掐断长下载。
-2. **扫描任务不接调用方的取消令牌**。调用方放弃等待 ≠ 扫描被取消。
-3. **候选全部试完才报 502**。只有「扫描完成且所有候选 IP 都连不上」才算上游不可用。
+2. **首批候选是真正的时间窗口**：任一 DNS 查询一返回就合并结果并尝试发布，另有独立计时器到点强制发布；首批只问延迟低、近期成功率高的前若干台，其余交给后台 worker 补齐。不会因为「这一批里有一台 DNS 慢」就把整个窗口拖到单次 DNS 超时。
+3. **扫描任务不接调用方的取消令牌**。调用方放弃等待 ≠ 扫描被取消。
+4. **回落按原因分项计数**：池为空 / 预算到期 / 无解析答案 / 候选全失败，四种情况的修法完全不同。候选全部建连失败时默认再用系统 DNS 兜底（`FallbackOnCandidatesFailed`，可关）；严格语义下才回 502。
 
 ### 转发层的性能取舍
 
@@ -56,8 +57,10 @@ GHT 是一个 Windows 桌面小工具：在本机开一个 HTTP 代理，**只�
 | 转发缓冲 | `ArrayPool<byte>` 复用 32KB | 每条连接、每次响应都新分配会持续制造 LOH 压力 |
 | 空闲超时 | 可重置的 `CancelAfter` | 旧实现每次 `Read` 都新建一个 linked CTS，大文件传输时每秒上万次分配 |
 | chunked 尺寸行 | 8KB 内部缓冲 + 内存扫描 | 旧实现 `byte[1]` 逐字节 `ReadAsync`，每读一个字符进一次内核 |
-| DNS 缓存 | 不可变数组快照 + 条目级锁 | 旧实现每次读取都进全局锁并 `ToArray()` 复制，高并发下是热点 |
+| DNS 缓存 | 不可变数组快照 + 逐地址 TTL + 条目级锁 | 旧实现每次读取都进全局锁并 `ToArray()` 复制，且整条缓存共用一个「取最大值」的过期时刻，短 TTL 的地址会跟着长 TTL 一起滞留 |
+| 首批候选 | 逐查询完成即发布 + 独立截止计时器 | 旧实现等整批 `Task.WhenAll` 才检查窗口，一台慢 DNS 就能把 200ms 窗口拖到 2s |
 | 竞速候选 | 失败退避 + 建连耗时 EWMA 排序 | 竞速本来就知道谁慢谁坏，顺手记下来，下次先试好的 |
+| 竞速套接字 | 只对胜出连接调大收发缓冲 | 旧实现给每个候选都设 256KB，竞速 8 个候选等于把内核缓冲成本乘以 8，而落败者几十毫秒就被释放 |
 | 扫描进度 | 120ms 时间节流 | 1200 台服务器逐个 `Report` 会把 UI 线程刷爆 |
 | 统计 UI | 窗口隐藏时停表 | 托盘运行期间不需要每秒拼字符串 |
 
@@ -110,6 +113,7 @@ dotnet publish src/GHT/GHT.csproj -c Release -r win-x64 --self-contained false `
 | `GlobalDnsWhitelist` | GitHub 相关 16 条 | 逗号或换行分隔，支持 `*` 通配；**可清空**，清空即全部走系统 DNS |
 | `DnsAccelEnabled` | `true` | 总开关 |
 | `ConnectBudgetMs` | `1500` | 首连预算；`0` = 不限（等价旧行为，作为回滚开关） |
+| `FallbackOnCandidatesFailed` | `true` | 加速池候选全部连不上时，再用系统 DNS 兜底；`false` = 直接 502（严格语义） |
 | `RaceMaxIps` | `8` | 单批并发竞速的 IP 数 |
 | `RaceConnectTimeoutMs` | `5000` | 单个 IP 建连超时 |
 | `RaceBatchBudgetMs` | `6000` | 单批竞速总预算 |
@@ -117,10 +121,10 @@ dotnet publish src/GHT/GHT.csproj -c Release -r win-x64 --self-contained false `
 | `RaceRetryDelayMs` | `800` | 重赛前等待（给后台扫描补候选的机会） |
 | `DnsScanConcurrency` | `128` | 扫描公共 DNS 的并发数 |
 | `DnsScanTimeoutMs` | `2000` | 单次 DNS 查询超时 |
-| `DnsCacheMinTtlSec` / `DnsCacheMaxTtlSec` | `60` / `600` | 解析结果缓存 TTL 区间 |
-| `FirstBatchCollectMs` | `200` | 首批结果聚合窗口，`0` = 不聚合 |
+| `DnsCacheMinTtlSec` / `DnsCacheMaxTtlSec` | `60` / `600` | 解析结果缓存 TTL 区间（逐地址计时） |
+| `FirstBatchCollectMs` | `200` | 首批窗口：到点无论凑够几个都先返回（`0` = 拿到第一个答案就返回） |
 | `FirstBatchMinIps` | `5` | 首批凑够几个 IP 就提前返回 |
-| `PoolResolveConcurrency` | `24` | 单域名每轮并发使用的 DNS 数量 |
+| `PoolResolveConcurrency` | `24` | 后台补齐时并发使用的 DNS 数量 |
 | `PreferIpv4` | `true` | 候选排序优先 IPv4 |
 | `CloseAction` | `Ask` | 关闭窗口行为：`Ask` / `Tray` / `Exit` |
 | `AutoStart` | `false` | 开机自启（写 HKCU `Run` 键，无需管理员） |
@@ -163,8 +167,8 @@ src/GHT/
     └── LogService.cs          异步批量落盘 + 按天分文件 + 大小轮转 + 内存缓冲
 
 tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平台运行）
-└── HttpHead / ChunkedBody / DnsMessage / DnsResultCache / ProxyStatistics
-    / LogService / DomainWildcardList / Settings
+└── HttpHead / ChunkedBody / DnsMessage / DnsResultCache / ResolverHub
+    / ProxyStatistics / LogService / DomainWildcardList / Settings
 ```
 
 ---
@@ -173,14 +177,14 @@ tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平�
 
 | 工作流 | 触发 | 做了什么 |
 |---|---|---|
-| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（79 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
+| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（89 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
 | `release.yml` | 推送 `v*` 标签 | 同上构建，打包 zip 并创建 GitHub Release |
 
 发布新版本：
 
 ```bash
-git tag v1.1.0
-git push origin v1.1.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 ---
@@ -192,6 +196,8 @@ git push origin v1.1.0
 - **明文 HTTP 采用「一次连接一个请求」**：向上游强制 `Connection: close`，换取转发逻辑的绝对可靠；HTTPS 走隧道不受影响。
 - **明文 HTTP 的帧是严格校验的**：只接受 chunked 与定长两种请求体；畸形头、折行头、重复且冲突的 `Content-Length`、非 chunked 结尾的 `Transfer-Encoding`、缺 CRLF 的分块一律回 400，不做「猜着转发」。
 - **端口 80/443 才走加速**：其他端口一律直连。
+- **候选全部连不上时默认再走一次系统 DNS**：系统 DNS 常常能解析出池里没有的另一组地址，直接 502 对用户没有好处。想恢复严格语义就把 `FallbackOnCandidatesFailed` 设为 `false`。两种路径在状态栏的回落分项里是分开计数的。
+- **状态栏的回落分项要会看**：`预算` 高说明 DNS 响应慢于预期（可调大 `ConnectBudgetMs` 或换池）；`无答案` 高说明这批 DNS 对该域名的解析不一致；`候选耗尽` 高说明解析出来的 IP 本身连不通；后面的「系统 DNS 成功 N/M」决定该不该继续依赖回落。
 - **强杀进程后系统代理会残留，但下次启动会自动修复**：接管前会把用户原有的 `ProxyEnable` / `ProxyServer` / `ProxyOverride` 快照到 `%LOCALAPPDATA%\GHT\proxy-backup.json`；正常退出按快照还原，下次启动若发现遗留快照且代理仍指向自己则自动还原。若之后不再启动本程序，需要手工关闭系统代理。
 - **首次启动需要先「扫描 + 应用结果」**：加速池为空时所有请求都会走系统 DNS（功能正常，但没有加速效果）；扫描结果不会自动写入配置。
 - **DNS 同时查询 A 与 AAAA**：纯 IPv4 环境下 AAAA 查询会空跑（两次往返并发发出，超时与 A 相同，不额外拖慢首连）。

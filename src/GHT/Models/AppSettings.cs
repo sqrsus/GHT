@@ -32,6 +32,13 @@ public sealed class AppSettings
     /// </summary>
     public int ConnectBudgetMs { get; set; } = 1500;
 
+    /// <summary>
+    /// 加速池候选全部建连失败后，是否再用系统 DNS 兜底（默认开）。
+    /// 系统 DNS 很可能解析出池里没有的另一组地址，直接回 502 对用户没有任何好处；
+    /// 设为 false 可恢复「候选试完即失败」的严格语义（便于定位池质量问题）。
+    /// </summary>
+    public bool FallbackOnCandidatesFailed { get; set; } = true;
+
     // ── 竞速 ────────────────────────────────────────────────
     /// <summary>单批并发竞速的 IP 数量上限。</summary>
     public int RaceMaxIps { get; set; } = 8;

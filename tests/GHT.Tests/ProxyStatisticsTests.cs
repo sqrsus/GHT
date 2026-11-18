@@ -96,4 +96,56 @@ public sealed class ProxyStatisticsTests
         Assert.Contains("github.com", snapshot.LastWinner);
         Assert.Equal("api.github.com", snapshot.LastFailure);
     }
+
+    [Fact]
+    public void Splits_fallbacks_by_reason()
+    {
+        var stats = new ProxyStatistics();
+
+        stats.AddFallback(FallbackReason.BudgetExpired);
+        stats.AddFallback(FallbackReason.BudgetExpired);
+        stats.AddFallback(FallbackReason.PoolEmpty);
+        stats.AddFallback(FallbackReason.NoDnsAnswer);
+        stats.AddFallback(FallbackReason.CandidatesFailed);
+        stats.AddPoolLoss();
+
+        var snapshot = stats.Snapshot();
+
+        Assert.Equal(2, snapshot.FallbackBudget);
+        Assert.Equal(1, snapshot.FallbackPoolEmpty);
+        Assert.Equal(1, snapshot.FallbackNoAnswer);
+        Assert.Equal(1, snapshot.FallbackCandidates);
+        Assert.Equal(5, snapshot.Fallbacks);
+
+        // 候选耗尽与「回落」是两件事：池子这一侧失败过一次，但不一定回落过
+        Assert.Equal(1, snapshot.PoolLosses);
+    }
+
+    [Fact]
+    public void Fallback_without_reason_is_not_counted()
+    {
+        var stats = new ProxyStatistics();
+
+        stats.AddFallback(FallbackReason.None);
+
+        Assert.Equal(0, stats.Snapshot().Fallbacks);
+    }
+
+    [Fact]
+    public void Tracks_fallback_direct_success_rate_and_average()
+    {
+        var stats = new ProxyStatistics();
+
+        stats.AddFallback(FallbackReason.BudgetExpired);
+        stats.AddFallbackResult(true, 100);
+        stats.AddFallbackResult(true, 300);
+        stats.AddFallbackResult(false, 0);
+
+        var snapshot = stats.Snapshot();
+
+        Assert.Equal(2, snapshot.FallbackDirectOk);
+        Assert.Equal(1, snapshot.FallbackDirectFail);
+        Assert.Equal(133, snapshot.FallbackDirectAvgMs);
+        Assert.Equal(2.0 / 3, snapshot.FallbackSuccessRate, 3);
+    }
 }
