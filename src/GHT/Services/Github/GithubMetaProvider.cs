@@ -4,6 +4,7 @@ using System.Net.Http;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using GHT.Services.Dns;
 
 namespace GHT.Services.Github;
 
@@ -391,7 +392,13 @@ public sealed class GithubMetaProvider : IDisposable
                 continue;
             }
 
-            target.Add(FromUInt32(value));
+            // 同一道过滤也用在官方地址上：列表本身理论上全是可路由段，但 /32 条目要是写成了
+            // 0.0.0.0 或 127.x，放进来同样会白占竞速名额。防御它比事后排查便宜。
+            var candidate = FromUInt32(value);
+            if (AddressPolicy.IsRoutable(candidate))
+            {
+                target.Add(candidate);
+            }
         }
     }
 

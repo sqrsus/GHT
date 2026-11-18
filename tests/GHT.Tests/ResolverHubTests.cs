@@ -96,14 +96,25 @@ public sealed class ResolverHubTests : IDisposable
     }
 
     [Fact]
-    public async Task Publishes_empty_result_when_window_expires_without_any_answer()
+    public async Task Window_expiry_without_any_answer_keeps_waiting_instead_of_publishing_empty()
     {
+        // 全部 DNS 都慢：150ms 窗口到点时一个答案都没有。
+        //
+        // 旧实现在这里<b>发布空数组</b>，等于当场宣布「池里对这个域名没有答案」，上层于是
+        // 要么直接回落系统 DNS，要么（注入静态候选时）拿一批未验证的远端地址去把首连预算烧光。
+        // 实测日志里 github.com / githubassets / alive.github.com 连续三次「首连预算用尽」
+        // 全部由此产生 —— 而它们的 DNS 答案在几百毫秒后其实是有的。
         var settings = BuildSettings(150, 5, 8, "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6");
 
         DnsQueryHandler handler = async (server, host, timeout, token, ipv6) =>
         {
-            await Task.Delay(3000, token);
-            return null;
+            if (ipv6)
+            {
+                return null;
+            }
+
+            await Task.Delay(400, token);
+            return AnswerFor(server);
         };
 
         var hub = new ResolverHub(settings, _log, handler);
@@ -112,10 +123,97 @@ public sealed class ResolverHubTests : IDisposable
         var candidates = await hub.ResolveAsync("github.com", CancellationToken.None);
         watch.Stop();
 
-        Assert.Empty(candidates);
+        // 关键断言：必须拿到真实答案，而不是「窗口到点就交白卷」
+        Assert.NotEmpty(candidates);
+
+        // 而且应该在首个答案到达时就返回，不能压到整轮扫描结束
         Assert.True(
-            watch.ElapsedMilliseconds < 1200,
-            $"无答案时应该按窗口立刻回落，实际等了 {watch.ElapsedMilliseconds}ms");
+            watch.ElapsedMilliseconds < 1500,
+            $"窗口到期后应尽快返回首个答案，实际等了 {watch.ElapsedMilliseconds}ms");
+    }
+
+    [Fact]
+    public async Task Publishes_empty_only_after_the_whole_sweep_finishes()
+    {
+        // 整轮扫描确实一个地址都没有 → 这时发布空结果是正确的（上层据此回落系统 DNS）。
+        // 这也是<b>唯一</b>允许发布空结果的路径。
+        var settings = BuildSettings(150, 5, 8, "10.0.0.1", "10.0.0.2", "10.0.0.3");
+
+        DnsQueryHandler handler = async (server, host, timeout, token, ipv6) =>
+        {
+            await Task.Delay(200, token);
+            return null;
+        };
+
+        var hub = new ResolverHub(settings, _log, handler);
+
+        var candidates = await hub.ResolveAsync("github.com", CancellationToken.None);
+
+        Assert.Empty(candidates);
+    }
+
+    [Fact]
+    public async Task Publishes_a_single_answer_after_the_window_expires()
+    {
+        // github.com 的 A 记录只有 1 个地址，32 台 DNS 答完去重后往往还是 1~2 个，
+        // 永远凑不到默认的 FirstBatchMinIps=5。窗口到点后必须改成「有一个发一个」，
+        // 否则首批会一直压到整轮扫描结束，等于没有窗口。
+        var settings = BuildSettings(100, 5, 8, "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4");
+
+        DnsQueryHandler handler = async (server, host, timeout, token, ipv6) =>
+        {
+            if (ipv6)
+            {
+                return null;
+            }
+
+            // 所有服务器都只答同一个地址 → 去重后永远只有 1 个
+            await Task.Delay(server.GetAddressBytes()[3] == 1 ? 50 : 2000, token);
+            return new DnsQueryResult(new[] { IPAddress.Parse("20.205.243.166") }, 60);
+        };
+
+        var hub = new ResolverHub(settings, _log, handler);
+
+        var watch = Stopwatch.StartNew();
+        var candidates = await hub.ResolveAsync("github.com", CancellationToken.None);
+        watch.Stop();
+
+        Assert.Single(candidates);
+        Assert.Equal(IPAddress.Parse("20.205.243.166"), candidates[0]);
+
+        // 第 1 台在 50ms 就答了，窗口之后应当立刻发布，而不是等剩下三台的 2000ms 超时
+        Assert.True(
+            watch.ElapsedMilliseconds < 1000,
+            $"首批被慢服务器拖住了：{watch.ElapsedMilliseconds}ms");
+    }
+
+    [Fact]
+    public async Task Drops_unroutable_answers_from_the_pool()
+    {
+        // 投毒型 DNS 把域名「解析」到 127.0.0.1 / 0.0.0.0 / ::1。这些地址必须进不了候选池。
+        var settings = BuildSettings(100, 1, 8, "10.0.0.1", "10.0.0.2", "10.0.0.3");
+
+        DnsQueryHandler handler = (server, host, timeout, token, ipv6) =>
+        {
+            var last = server.GetAddressBytes()[3];
+
+            DnsQueryResult? result = last switch
+            {
+                1 => new DnsQueryResult(new[] { IPAddress.Parse("127.0.0.1") }, 60),
+                2 => new DnsQueryResult(new[] { IPAddress.Parse("0.0.0.0") }, 60),
+                _ => new DnsQueryResult(new[] { IPAddress.Parse("20.205.243.166") }, 60)
+            };
+
+            return Task.FromResult(result);
+        };
+
+        var hub = new ResolverHub(settings, _log, handler);
+
+        var candidates = await hub.ResolveAsync("github.com", CancellationToken.None);
+
+        Assert.DoesNotContain(IPAddress.Parse("127.0.0.1"), candidates);
+        Assert.DoesNotContain(IPAddress.Parse("0.0.0.0"), candidates);
+        Assert.Contains(IPAddress.Parse("20.205.243.166"), candidates);
     }
 
     [Fact]

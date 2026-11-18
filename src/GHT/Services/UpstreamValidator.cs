@@ -33,14 +33,26 @@ public readonly record struct CandidateVerdict(
 /// </summary>
 public sealed class UpstreamValidator
 {
-    /// <summary>单次探测上限。超过它说明这个地址对我们的意义不大，不必等。</summary>
-    private const int ProbeTimeoutMs = 3000;
+    /// <summary>
+    /// 单次探测上限。超过它说明这个地址对我们的意义不大，不必等。
+    /// 实测成功的跨境 TLS 握手在 320~490ms，1200ms 已足够覆盖抖动；定得更长只会让一个
+    /// 注定失败的探测长期占住 <see cref="MaxConcurrentProbes"/> 的槽位
+    /// （日志里大量 3 秒 timeout 就是这么来的）。
+    /// </summary>
+    private const int ProbeTimeoutMs = 1200;
 
     /// <summary>同时在跑的探测数。GS 会在一次请求里塞进最多 8 个未验证候选，这里收一下。</summary>
     private const int MaxConcurrentProbes = 4;
 
     /// <summary>一次 Warm 最多探测多少个候选，避免冷启动瞬间打出一串握手。</summary>
     private const int MaxWarmPerCall = 8;
+
+    /// <summary>
+    /// 同一主机两次 Warm 之间的最小间隔。
+    /// <see cref="Warm"/> 是每个请求都调的：一个高 QPS 的页面能在几秒内把几百次探测
+    /// 排进只有 4 个槽位的队列，结论要几十秒后才落缓存，闸门等于形同虚设。
+    /// </summary>
+    private const int WarmIntervalMs = 30_000;
 
     /// <summary>正负结果的缓存时长。地址状态会变，但十分钟内基本稳定。</summary>
     private static readonly TimeSpan DefaultTrustTtl = TimeSpan.FromMinutes(10);
@@ -53,23 +65,30 @@ public sealed class UpstreamValidator
     private readonly LogService _log;
     private readonly TimeSpan _trustTtl;
     private readonly TimeSpan _rejectTtl;
+    private readonly Action<IPAddress>? _onReject;
     private readonly ConcurrentDictionary<string, Verdict> _cache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, Lazy<Task<bool>>> _inflight = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> _lastWarmTicks = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _probeSlots = new(MaxConcurrentProbes, MaxConcurrentProbes);
 
     private long _probes;
     private long _rejects;
 
-    public UpstreamValidator(LogService log)
-        : this(log, DefaultTrustTtl, DefaultRejectTtl)
+    /// <param name="onReject">
+    /// 判定某地址不可用时的回调。生产环境接到 <see cref="UpstreamRacer.ReportReject"/>，
+    /// 让「TLS 判坏」这件事进入竞速的健康度，否则同一个地址会被反复选中、反复失败。
+    /// </param>
+    public UpstreamValidator(LogService log, Action<IPAddress>? onReject = null)
+        : this(log, DefaultTrustTtl, DefaultRejectTtl, onReject)
     {
     }
 
-    internal UpstreamValidator(LogService log, TimeSpan trustTtl, TimeSpan rejectTtl)
+    internal UpstreamValidator(LogService log, TimeSpan trustTtl, TimeSpan rejectTtl, Action<IPAddress>? onReject = null)
     {
         _log = log;
         _trustTtl = trustTtl;
         _rejectTtl = rejectTtl;
+        _onReject = onReject;
     }
 
     private readonly record struct Verdict(bool Ok, long ExpiresTicks, string Reason);
@@ -127,6 +146,21 @@ public sealed class UpstreamValidator
     public void Warm(string host, int port, IReadOnlyList<IPAddress> candidates, CancellationToken lifetime)
     {
         if (port != 443 || candidates.Count == 0)
+        {
+            return;
+        }
+
+        var now = Environment.TickCount64;
+        var last = _lastWarmTicks.GetOrAdd(host, 0L);
+
+        // 0 是「从未 Warm」的哨兵：第一次必须放行，否则开机 30 秒内闸门一直不热身
+        if (last != 0 && now - last < WarmIntervalMs)
+        {
+            return;
+        }
+
+        // CAS：并发请求里只有一个能真正发起这一轮探测
+        if (!_lastWarmTicks.TryUpdate(host, now, last))
         {
             return;
         }
@@ -264,6 +298,17 @@ public sealed class UpstreamValidator
         {
             Interlocked.Increment(ref _rejects);
             _log.Debug($"TLS 校验拒绝 {host} → {address}: {reason}");
+
+            // 回灌给竞速器。不回灌的后果在日志里很直观：20.233.83.149 先以 4ms 的 TCP 建连
+            // 赢下竞速、随即被 TLS 判坏，下一次请求它又会因为「建连快」再次胜出。
+            try
+            {
+                _onReject?.Invoke(address);
+            }
+            catch
+            {
+                // 回灌失败不该影响探测结论
+            }
         }
 
         return ok;

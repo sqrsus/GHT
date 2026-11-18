@@ -95,7 +95,9 @@ public sealed class ProxyServer : IAsyncDisposable
         _log = log;
         _resolver = new ResolverHub(settings, log);
         _racer = new UpstreamRacer(log);
-        _validator = new UpstreamValidator(log);
+
+        // TLS 判坏必须进竞速的健康度，否则「建连快但用不了」的地址会被反复选中。
+        _validator = new UpstreamValidator(log, _racer.ReportReject);
         _githubMeta = new GithubMetaProvider(log);
         _whitelist = DomainWildcardList.Parse(settings.GlobalDnsWhitelist);
 
@@ -657,7 +659,7 @@ public sealed class ProxyServer : IAsyncDisposable
             }
         }
 
-        var merged = MergeCandidates(resolved, seeds);
+        var merged = CandidateMerger.Merge(resolved, seeds);
 
         if (merged.Count == 0)
         {
@@ -742,42 +744,6 @@ public sealed class ProxyServer : IAsyncDisposable
         }
 
         return (null, PoolOutcome.CandidatesFailed);
-    }
-
-    /// <summary>
-    /// 交错合并 DNS 候选与官方静态候选。
-    ///
-    /// 交错（而不是追加）是有意的：一批竞速最多只取 <c>RaceMaxIps</c> 个，如果静态地址整段排在后面，
-    /// 首批就永远轮不到它们，「换一个区域试试」这件事只能等到重赛才发生。交错能让首批同时包含
-    /// 「DNS 当前答案」和「官方地址」，谁快谁赢。
-    /// </summary>
-    private static List<IPAddress> MergeCandidates(
-        IReadOnlyList<IPAddress> primary,
-        IReadOnlyList<IPAddress> seeds)
-    {
-        if (seeds.Count == 0)
-        {
-            return new List<IPAddress>(primary);
-        }
-
-        var merged = new List<IPAddress>(primary.Count + seeds.Count);
-        var seen = new HashSet<IPAddress>(primary.Count + seeds.Count);
-        var length = Math.Max(primary.Count, seeds.Count);
-
-        for (var i = 0; i < length; i++)
-        {
-            if (i < primary.Count && seen.Add(primary[i]))
-            {
-                merged.Add(primary[i]);
-            }
-
-            if (i < seeds.Count && seen.Add(seeds[i]))
-            {
-                merged.Add(seeds[i]);
-            }
-        }
-
-        return merged;
     }
 
     /// <summary>

@@ -282,6 +282,32 @@ public sealed class UpstreamRacer
     }
 
     /// <summary>
+    /// 外部（TLS 校验闸门）判定某地址不可用。
+    ///
+    /// 与 <see cref="RecordFailure"/> 的区别在于「这次失败意味着什么」：TCP 建连失败可能只是
+    /// 瞬时抖动，而 TLS 证书校验失败意味着这个地址<b>根本不为该主机服务</b>，重试毫无意义。
+    /// 所以直接给一个不低于 3 的失败基数（退避 15 秒起），而不是从 1 慢慢爬 ——
+    /// 否则刚被判坏的地址会立刻又以「TCP 建连只要 4ms」的身份赢下下一次竞速，
+    /// 形成「选得快 → 连不上 → 再选它」的死循环。
+    /// </summary>
+    public void ReportReject(IPAddress? address)
+    {
+        if (address is null)
+        {
+            return;
+        }
+
+        var health = _health.GetOrAdd(address.ToString(), _ => new AddressHealth());
+
+        if (health.Failures < 3)
+        {
+            health.Failures = 3;
+        }
+
+        Volatile.Write(ref health.LastFailureTicks, Environment.TickCount64);
+    }
+
+    /// <summary>
     /// 回收落败者：取消已发生，先给它们一点时间自然结束，再把「已经成功但迟到的连接」释放掉。
     /// 未完成的任务不必强拆——它们的 catch 分支会自行 Dispose。
     /// </summary>

@@ -214,14 +214,15 @@ public sealed class ResolverHub
         var found = new List<IPAddress>(16);
         var seen = new HashSet<IPAddress>();
         var published = 0;
+        var deadlineExpired = 0;
 
         var window = Math.Max(0, _firstBatchMs);
 
         // window == 0 表示「不聚合」：拿到第一个答案就返回，但也不能在还没有答案时抢先发布空结果。
         var minIps = window <= 0 ? 1 : Math.Max(1, _firstBatchMinIps);
 
-        // 发布只由两件事触发：任一查询完成（凑够 minIps）、或独立截止计时器到点。
-        void TryPublish(bool force)
+        // 发布由三件事触发：凑够 minIps、截止计时器到点、整轮扫描结束。
+        void TryPublish(bool force, bool allowEmpty = false)
         {
             if (Volatile.Read(ref published) != 0)
             {
@@ -232,12 +233,39 @@ public sealed class ResolverHub
 
             lock (found)
             {
-                if (!force && found.Count < minIps)
+                if (allowEmpty)
                 {
-                    return;
+                    // 整轮扫描已经结束：有多少发多少，哪怕是空。
+                    // 这是唯一允许发布空结果的路径 —— 不收在这里，等待者会永远等下去
+                    // （调用方传的是 CancellationToken.None 时就是死锁）。
+                    snapshot = found.ToArray();
                 }
+                else
+                {
+                    // 两条都不能省，各自挡住一类真实故障：
 
-                snapshot = found.ToArray();
+                    // (1) 到点（force）只是「不再等凑够 minIps」，<b>不是</b>「允许发布空结果」。
+                    //     跨境 UDP 到公共 DNS 的 RTT 经常 150~400ms，200ms 窗口到点时一台都没回是常态。
+                    //     发布空数组等于当场宣布「池里对这个域名没有答案」，上层于是要么直接回落系统 DNS，
+                    //     要么（有静态候选时）拿一批未验证的远端地址把首连预算烧光。
+                    //     实测日志里 github.com / githubassets / alive.github.com 连续三次「首连预算用尽」
+                    //     全部由此产生，而它们的 DNS 答案在几百毫秒后其实是有的。
+                    if (found.Count == 0)
+                    {
+                        return;
+                    }
+
+                    // (2) 窗口到点之后，「凑够 minIps」这个条件必须作废，改成有一个发一个。
+                    //     github.com 的 A 记录只有 1 个地址，32 台 DNS 答完去重后往往还是 1~2 个，
+                    //     永远凑不到默认的 5 个 —— 首批会一直压到整轮扫描结束，等于没有窗口。
+                    var required = force || Volatile.Read(ref deadlineExpired) != 0 ? 1 : minIps;
+                    if (found.Count < required)
+                    {
+                        return;
+                    }
+
+                    snapshot = found.ToArray();
+                }
             }
 
             if (Interlocked.Exchange(ref published, 1) == 0)
@@ -248,7 +276,14 @@ public sealed class ResolverHub
 
         using var deadline = new CancellationTokenSource();
         var deadlineTask = window > 0
-            ? PublishOnDeadlineAsync(window, () => TryPublish(force: true), deadline.Token)
+            ? PublishOnDeadlineAsync(
+                window,
+                () =>
+                {
+                    Volatile.Write(ref deadlineExpired, 1);
+                    TryPublish(force: true);
+                },
+                deadline.Token)
             : Task.CompletedTask;
 
         using var guard = new CancellationTokenSource(TimeSpan.FromMilliseconds(Math.Max(4000, _timeoutMs * 8)));
@@ -257,31 +292,29 @@ public sealed class ResolverHub
         {
             var ordered = OrderByHealth(pool);
 
-            // 首批只问「延迟低、近期成功率高」的前若干台，其余留给后台。
-            var headCount = Math.Min(ordered.Count, Math.Clamp(Math.Max(minIps * 2, 8), 8, FirstBatchServerCap));
+            // 首批问多少台：旧值 10 台的假设是「最快的那几台一定答得回来」，但跨境 DNS 的 RTT
+            // 分布很散，前 10 台同时碰上抖动的概率并不低。放宽到 16~32 台，
+            // 代价是首批多十几个 UDP 包（可忽略），收益是首批空手的概率显著下降。
+            var headCount = Math.Min(ordered.Count, Math.Clamp(Math.Max(minIps * 4, 16), 16, FirstBatchServerCap));
+
+            Action onAnswer = () => TryPublish(force: false);
 
             var head = new Task[headCount];
             for (var i = 0; i < headCount; i++)
             {
-                head[i] = QueryOneAsync(
-                    ordered[i],
-                    host,
-                    found,
-                    seen,
-                    generation,
-                    () => TryPublish(force: false),
-                    guard.Token);
+                head[i] = QueryOneAsync(ordered[i], host, found, seen, generation, onAnswer, guard.Token);
             }
 
-            await Task.WhenAll(head).ConfigureAwait(false);
+            // 后台补齐<b>与首批并行</b>，而不是等首批全部结束才开始。
+            // 旧实现是 `await Task.WhenAll(head)` 之后才 drain，于是「首批那十几台都慢」
+            // 会直接放大成「整轮都慢」：drain 要等最慢的那台超时才开工，首批窗口早就过完了。
+            // 现在两边同时跑，谁先摸到答案谁触发发布。drain 也必须带 onAnswer ——
+            // 否则它找到的地址不会触发发布，只能等整轮结束。
+            var drain = headCount < ordered.Count
+                ? DrainAsync(ordered, headCount, host, found, seen, generation, onAnswer, guard.Token)
+                : Task.CompletedTask;
 
-            // 这里刻意<b>不</b>急着发布空结果：首批没答案不代表池子没答案，
-            // 后面还有服务器没问。收口交给截止计时器（窗口）或整轮扫描结束，
-            // 否则会把「后面几台能答」的池子直接判死，白白回落系统 DNS。
-            if (headCount < ordered.Count)
-            {
-                await DrainAsync(ordered, headCount, host, found, seen, generation, guard.Token).ConfigureAwait(false);
-            }
+            await Task.WhenAll(head.Append(drain)).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -289,7 +322,9 @@ public sealed class ResolverHub
         }
         finally
         {
-            TryPublish(force: true);
+            // 整轮结束还是空的，说明池子确实给不出这个域名的任何可用地址 ——
+            // 这是唯一允许发布空结果的地方，上层据此回落系统 DNS。
+            TryPublish(force: true, allowEmpty: true);
 
             try
             {
@@ -304,7 +339,9 @@ public sealed class ResolverHub
     }
 
     /// <summary>
-    /// 后台补齐：固定数量 worker 从剩余服务器里取活，只写缓存与候选表，不影响任何等待者。
+    /// 后台补齐：固定数量 worker 从剩余服务器里取活，写缓存与候选表。
+    /// <paramref name="onResult"/> 与首批共用同一个发布回调 —— drain 摸到的地址同样会触发首批发布，
+    /// 否则「首批那十几台都慢、后面几台很快」这种情况会一直压到整轮结束才返回。
     /// </summary>
     private async Task DrainAsync(
         IReadOnlyList<DnsPoolEntry> ordered,
@@ -313,6 +350,7 @@ public sealed class ResolverHub
         List<IPAddress> found,
         HashSet<IPAddress> seen,
         int generation,
+        Action? onResult,
         CancellationToken token)
     {
         var workers = Math.Min(Math.Max(1, _concurrency), ordered.Count - startIndex);
@@ -346,7 +384,7 @@ public sealed class ResolverHub
                     return;
                 }
 
-                await QueryOneAsync(ordered[index], host, found, seen, generation, null, token).ConfigureAwait(false);
+                await QueryOneAsync(ordered[index], host, found, seen, generation, onResult, token).ConfigureAwait(false);
             }
         }
 
@@ -419,7 +457,8 @@ public sealed class ResolverHub
 
         var addresses = new List<IPAddress>(8);
         var ttl = _maxTtl;
-        var hit = false;
+        var answered = false;
+        var dropped = 0;
 
         foreach (var answer in answers)
         {
@@ -434,16 +473,39 @@ public sealed class ResolverHub
                 continue;
             }
 
-            hit = true;
-            addresses.AddRange(result.Addresses);
+            answered = true;
+
+            // 入池前就丢掉不可路由地址。投毒/劫持型公共 DNS 会把域名「解析」到 127.0.0.1、
+            // 0.0.0.0、::1，这些地址留在池里只会：占掉竞速名额、把每次必败记成地址健康度、
+            // 以及让 TLS 探测把并发槽浪费在连本机这种毫无意义的目标上。
+            foreach (var address in result.Addresses)
+            {
+                if (AddressPolicy.IsRoutable(address))
+                {
+                    addresses.Add(address);
+                }
+                else
+                {
+                    dropped++;
+                }
+            }
 
             // 一次合并内的 TTL 取最小值：宁可早一点重新解析，也不要把快过期的地址留太久
             ttl = Math.Min(ttl, Math.Clamp(result.TtlSeconds, _minTtl, _maxTtl));
         }
 
-        if (!hit)
+        if (!answered)
         {
             RecordHealth(entry.Ip, false);
+            return;
+        }
+
+        if (addresses.Count == 0)
+        {
+            // 有应答，但答案全是不可路由地址 —— 这台 DNS 对这个域名是投毒源。
+            // 计入失败，首批排序会把它挪到后面，后续扫描就少踩一次。
+            RecordHealth(entry.Ip, false);
+            _log.Debug($"{entry.Ip} 对 {host} 返回 {dropped} 个不可路由地址，已全部丢弃");
             return;
         }
 
