@@ -23,6 +23,13 @@ public sealed class ResolverHub
     private readonly ConcurrentDictionary<string, Task<IReadOnlyList<IPAddress>>> _sweeps =
         new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// 每台公共 DNS 在运行期的命中/失败计数。UI 用它在加速池里显示「健康 / 降级 / 失效」，
+    /// 否则用户只能看到一个扫描时的静态延迟，无法判断这台 DNS 现在还灵不灵。
+    /// </summary>
+    private readonly ConcurrentDictionary<string, ServerHealth> _serverHealth =
+        new(StringComparer.OrdinalIgnoreCase);
+
     private volatile IReadOnlyList<DnsPoolEntry> _pool = Array.Empty<DnsPoolEntry>();
 
     /// <summary>加速池版本号。每次换池自增，用来丢弃「换池前发起、换池后才完成」的扫描结果。</summary>
@@ -49,6 +56,23 @@ public sealed class ResolverHub
     public int PoolCount => _pool.Count;
 
     public int CachedDomainCount => _cache.Count;
+
+    /// <summary>取某台公共 DNS 的成功/失败次数（从未参与解析时返回 (0,0)）。</summary>
+    public (int Ok, int Fail) GetServerHealth(string ip)
+    {
+        if (string.IsNullOrEmpty(ip) || !_serverHealth.TryGetValue(ip, out var health))
+        {
+            return (0, 0);
+        }
+
+        return (Volatile.Read(ref health.Ok), Volatile.Read(ref health.Fail));
+    }
+
+    private sealed class ServerHealth
+    {
+        public int Ok;
+        public int Fail;
+    }
 
     public void ApplySettings(AppSettings settings)
     {
@@ -140,7 +164,7 @@ public sealed class ResolverHub
             }
 
             var found = new List<IPAddress>(16);
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seen = new HashSet<IPAddress>();
             var stopwatch = Stopwatch.StartNew();
 
             var window = Math.Max(0, _firstBatchMs);
@@ -206,7 +230,7 @@ public sealed class ResolverHub
         DnsPoolEntry entry,
         string host,
         List<IPAddress> found,
-        HashSet<string> seen,
+        HashSet<IPAddress> seen,
         int generation,
         CancellationToken token)
     {
@@ -250,8 +274,11 @@ public sealed class ResolverHub
 
         if (!hit)
         {
+            RecordHealth(entry.Ip, false);
             return;
         }
+
+        RecordHealth(entry.Ip, true);
 
         _cache.Merge(host, addresses, ttl, _preferIpv4);
 
@@ -259,13 +286,27 @@ public sealed class ResolverHub
         {
             foreach (var address in addresses)
             {
-                if (seen.Add(address.ToString()))
+                if (seen.Add(address))
                 {
                     found.Add(address);
                 }
             }
 
             found.Sort(CompareAddress);
+        }
+    }
+
+    private void RecordHealth(string ip, bool ok)
+    {
+        var health = _serverHealth.GetOrAdd(ip, _ => new ServerHealth());
+
+        if (ok)
+        {
+            Interlocked.Increment(ref health.Ok);
+        }
+        else
+        {
+            Interlocked.Increment(ref health.Fail);
         }
     }
 

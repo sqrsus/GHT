@@ -48,6 +48,21 @@ GHT 是一个 Windows 桌面小工具：在本机开一个 HTTP 代理，**只�
 2. **扫描任务不接调用方的取消令牌**。调用方放弃等待 ≠ 扫描被取消。
 3. **候选全部试完才报 502**。只有「扫描完成且所有候选 IP 都连不上」才算上游不可用。
 
+### 转发层的性能取舍
+
+| 位置 | 做法 | 为什么 |
+|---|---|---|
+| 日志 | 有界队列 + 单后台任务批量落盘 | 旧实现把 `File.AppendAllText` 放在调用线程的锁里，杀软/磁盘抖动会拖住所有代理线程 |
+| 转发缓冲 | `ArrayPool<byte>` 复用 32KB | 每条连接、每次响应都新分配会持续制造 LOH 压力 |
+| 空闲超时 | 可重置的 `CancelAfter` | 旧实现每次 `Read` 都新建一个 linked CTS，大文件传输时每秒上万次分配 |
+| chunked 尺寸行 | 8KB 内部缓冲 + 内存扫描 | 旧实现 `byte[1]` 逐字节 `ReadAsync`，每读一个字符进一次内核 |
+| DNS 缓存 | 不可变数组快照 + 条目级锁 | 旧实现每次读取都进全局锁并 `ToArray()` 复制，高并发下是热点 |
+| 竞速候选 | 失败退避 + 建连耗时 EWMA 排序 | 竞速本来就知道谁慢谁坏，顺手记下来，下次先试好的 |
+| 扫描进度 | 120ms 时间节流 | 1200 台服务器逐个 `Report` 会把 UI 线程刷爆 |
+| 统计 UI | 窗口隐藏时停表 | 托盘运行期间不需要每秒拼字符串 |
+
+隧道转发保留**半关闭**语义：一侧正常 EOF 时只 `Shutdown(Send)`，另一方向继续；**空闲超时不发 FIN**，否则「长时间只收不发」的大文件下载会被提前掐断。
+
 ---
 
 ## 三、快速开始
@@ -56,10 +71,12 @@ GHT 是一个 Windows 桌面小工具：在本机开一个 HTTP 代理，**只�
 
 1. 到 [Releases](https://github.com/sqrsus/GHT/releases) 下载 `GHT-*-win-x64.zip` 解压，或使用 CI 产物里的 `dist/GHT.exe`。
 2. 双击运行（框架依赖版需要机器上有 [.NET 8 桌面运行时](https://dotnet.microsoft.com/download/dotnet/8.0)）。
-3. 点「扫描并应用」，等扫描完成后确认，再点「启动加速」。
+3. 点「扫描」，结果会先以候选形式列在右侧表格里（带延迟），确认后点「应用结果」写入加速池，再点「启动加速」。
+   - 扫描过程中可随时点「取消」，不影响已应用的加速池。
    - 启动后会自动把系统代理（当前用户）指向 `127.0.0.1:7890`，并把**你原本的代理设置**快照到 `proxy-backup.json`。
    - 点「停止加速」或退出程序时按快照还原（没有快照时只关闭指向本机回环的代理，不动你自己配置的代理）。
    - 若进程被强杀，下次启动会自动检测残留快照并还原，不会让全机一直指向已关闭的端口。
+4. 想确认「加速到底有没有生效」，用「域名诊断」：输入域名与端口，它会用加速池解析 A/AAAA、对候选 IP 做一次 TCP 竞速，并给出结论与逐台 DNS 明细。
 
 ### 从源码构建
 
@@ -121,29 +138,33 @@ dotnet publish src/GHT/GHT.csproj -c Release -r win-x64 --self-contained false `
 ```
 src/GHT/
 ├── App.xaml(.cs)              单实例闸门、配置装载、退出清理
-├── MainWindow.xaml(.cs)       单页 UI：启停 / 白名单 / 加速池 / 参数 / 日志
+├── MainWindow.xaml(.cs)       单页 UI：启停 / 白名单 / 加速池 / 诊断 / 参数 / 日志
+├── ViewModels/
+│   └── DnsPoolRow.cs          加速池表格行（延迟 + 运行期健康度）
 ├── Models/
 │   ├── AppSettings.cs         配置模型（含默认白名单）
 │   ├── DnsPoolEntry.cs        加速池条目
-│   └── ProxyStatistics.cs     计数器快照
+│   └── ProxyStatistics.cs     计数器快照（含字节数、活跃隧道、首连 P50/P95）
 └── Services/
     ├── ProxyServer.cs         接入、选路编排、隧道与明文转发
     ├── ProxyProtocol.cs       HTTP 常量、逐跳头规则、错误响应
-    ├── UpstreamRacer.cs       TCP 建连竞速
-    ├── ResolverHub.cs         域名 → 候选 IP（预算语义、后台扫描、渐进缓存）
-    ├── Http/                  请求头解析、前置缓冲流
+    ├── UpstreamRacer.cs       TCP 建连竞速 + 地址健康度
+    ├── ResolverHub.cs         域名 → 候选 IP（预算语义、后台扫描、渐进缓存、DNS 健康度）
+    ├── Diagnostics/           域名诊断（复用 DNS 扫描与竞速，产出可复制报告）
+    ├── Http/                  请求头解析、前置缓冲流、带缓冲的行读取流
     ├── Dns/                   DNS 报文编解码、UDP 客户端、扫描器、结果缓存、内置清单
     ├── SystemProxy.cs         系统代理注册表读写 + WinINet 刷新
     ├── SettingsStore.cs       配置读写与越界收敛
     ├── SingleInstance.cs      Mutex + 命名管道唤出
-    ├── TrayIconService.cs     托盘图标与菜单
+    ├── TrayIconService.cs     托盘图标、菜单与气泡
     ├── AutoStart.cs           开机自启
     ├── AppPaths.cs            %LOCALAPPDATA%\GHT 路径与旧配置迁移
     ├── DomainWildcardList.cs  通配域名匹配
-    └── LogService.cs          按天分文件日志 + 大小轮转 + 内存缓冲
+    └── LogService.cs          异步批量落盘 + 按天分文件 + 大小轮转 + 内存缓冲
 
 tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平台运行）
-└── HttpHead / ChunkedBody / DnsMessage / DomainWildcardList / Settings
+└── HttpHead / ChunkedBody / DnsMessage / DnsResultCache / ProxyStatistics
+    / LogService / DomainWildcardList / Settings
 ```
 
 ---
@@ -152,14 +173,14 @@ tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平�
 
 | 工作流 | 触发 | 做了什么 |
 |---|---|---|
-| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（59 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
+| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（79 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
 | `release.yml` | 推送 `v*` 标签 | 同上构建，打包 zip 并创建 GitHub Release |
 
 发布新版本：
 
 ```bash
-git tag v1.0.1
-git push origin v1.0.1
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 ---
@@ -172,9 +193,10 @@ git push origin v1.0.1
 - **明文 HTTP 的帧是严格校验的**：只接受 chunked 与定长两种请求体；畸形头、折行头、重复且冲突的 `Content-Length`、非 chunked 结尾的 `Transfer-Encoding`、缺 CRLF 的分块一律回 400，不做「猜着转发」。
 - **端口 80/443 才走加速**：其他端口一律直连。
 - **强杀进程后系统代理会残留，但下次启动会自动修复**：接管前会把用户原有的 `ProxyEnable` / `ProxyServer` / `ProxyOverride` 快照到 `%LOCALAPPDATA%\GHT\proxy-backup.json`；正常退出按快照还原，下次启动若发现遗留快照且代理仍指向自己则自动还原。若之后不再启动本程序，需要手工关闭系统代理。
-- **首次启动需要先「扫描并应用」**：加速池为空时所有请求都会走系统 DNS（功能正常，但没有加速效果）。
+- **首次启动需要先「扫描 + 应用结果」**：加速池为空时所有请求都会走系统 DNS（功能正常，但没有加速效果）；扫描结果不会自动写入配置。
 - **DNS 同时查询 A 与 AAAA**：纯 IPv4 环境下 AAAA 查询会空跑（两次往返并发发出，超时与 A 相同，不额外拖慢首连）。
-- **日志默认不落 DEBUG**：DEBUG 只进内存（UI 可见）；排查时设 `GHT_LOG_DEBUG=1` 再启动。日志按 4MB 分卷、保留 14 天。
+- **日志默认不落 DEBUG**：DEBUG 只进内存（UI 可见）；排查时设 `GHT_LOG_DEBUG=1` 再启动。日志按 4MB 分卷、保留 14 天，写入是异步的（进程被强杀时最多丢队列里最后几批）。
+- **诊断结果是快照**：它反映点击那一刻的解析与建连情况，不代表运行期代理的逐请求行为。
 
 ---
 

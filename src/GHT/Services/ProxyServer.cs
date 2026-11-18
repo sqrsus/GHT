@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -19,6 +21,11 @@ namespace GHT.Services;
 ///
 /// 生命周期用信号量 + 状态机串行化：UI 连点、托盘菜单与退出清理可能同时触发启动/停止，
 /// 只靠 <c>IsRunning</c> 判断会出现两个监听器（其中一个无人持有、也无人停止）。
+///
+/// 转发层的三条性能纪律（都是这里最容易退化的地方）：
+/// 1) 转发缓冲用 <see cref="ArrayPool{T}"/>，不每条连接新分配 32KB；
+/// 2) 空闲超时用「可重置的 CancelAfter」，而不是每次 Read 都 CreateLinkedTokenSource（旧实现每次读都新建一个 CTS）；
+/// 3) 分块体的尺寸行/尾部头用 <see cref="LineBufferedStream"/> 批量读，不再逐字节进内核。
 /// </summary>
 public sealed class ProxyServer : IAsyncDisposable
 {
@@ -27,6 +34,9 @@ public sealed class ProxyServer : IAsyncDisposable
     private const int TunnelIdleMs = 60_000;
     private const int ResponseIdleMs = 120_000;
     private const int DirectConnectTimeoutMs = 8_000;
+
+    /// <summary>套接字缓冲：默认 64KB 在长肥管道上会限制单流吞吐。</summary>
+    private const int SocketBufferBytes = 256 * 1024;
 
     /// <summary>单块上限。远超正常分块大小，但能挡住「分块长度写成 2GB」这类攻击。</summary>
     private const int MaxChunkBytes = 64 * 1024 * 1024;
@@ -252,6 +262,7 @@ public sealed class ProxyServer : IAsyncDisposable
             using (client)
             {
                 client.NoDelay = true;
+                TuneSocket(client.Client);
 
                 var stream = client.GetStream();
                 HeadReadResult? headRead;
@@ -287,7 +298,7 @@ public sealed class ProxyServer : IAsyncDisposable
 
                 if (string.Equals(head.Method, "CONNECT", StringComparison.OrdinalIgnoreCase))
                 {
-                    await HandleConnectAsync(stream, body, head, token).ConfigureAwait(false);
+                    await HandleConnectAsync(client, stream, body, head, token).ConfigureAwait(false);
                 }
                 else
                 {
@@ -317,7 +328,12 @@ public sealed class ProxyServer : IAsyncDisposable
 
     // ── CONNECT 隧道 ────────────────────────────────────────────────────
 
-    private async Task HandleConnectAsync(Stream clientStream, Stream clientInput, HttpHead head, CancellationToken token)
+    private async Task HandleConnectAsync(
+        TcpClient client,
+        Stream clientStream,
+        Stream clientInput,
+        HttpHead head,
+        CancellationToken token)
     {
         var (host, port) = SplitHostPort(head.Target, 443);
         if (string.IsNullOrWhiteSpace(host))
@@ -326,6 +342,7 @@ public sealed class ProxyServer : IAsyncDisposable
             return;
         }
 
+        var connectWatch = Stopwatch.StartNew();
         TcpClient upstream;
 
         try
@@ -335,25 +352,41 @@ public sealed class ProxyServer : IAsyncDisposable
         catch (UpstreamUnavailableException ex)
         {
             _statistics.AddError();
+            _statistics.NoteFailure(host);
             await WriteErrorAsync(clientStream, 502, "Bad Gateway", ex.Message, token).ConfigureAwait(false);
             return;
         }
         catch (Exception ex) when (ex is SocketException or IOException or TimeoutException)
         {
             _statistics.AddError();
+            _statistics.NoteFailure(host);
             await WriteErrorAsync(clientStream, 502, "Bad Gateway", $"{host}:{port} 建连失败：{ex.Message}", token)
                 .ConfigureAwait(false);
             return;
         }
 
+        _statistics.AddConnectSample((int)connectWatch.ElapsedMilliseconds);
+
         using (upstream)
         {
+            TuneSocket(upstream.Client);
+
             await clientStream.WriteAsync(ProxyProtocol.ConnectEstablished, token).ConfigureAwait(false);
             await clientStream.FlushAsync(token).ConfigureAwait(false);
 
             var upstreamStream = upstream.GetStream();
-            await RelayAsync(clientInput, clientStream, upstreamStream, token).ConfigureAwait(false);
-            _statistics.AddTunnel();
+
+            _statistics.TunnelOpened();
+
+            try
+            {
+                await RelayAsync(client, clientStream, upstream, upstreamStream, token).ConfigureAwait(false);
+            }
+            finally
+            {
+                _statistics.TunnelClosed();
+                _statistics.AddTunnel();
+            }
         }
     }
 
@@ -374,6 +407,7 @@ public sealed class ProxyServer : IAsyncDisposable
             return;
         }
 
+        var connectWatch = Stopwatch.StartNew();
         TcpClient upstream;
 
         try
@@ -383,19 +417,25 @@ public sealed class ProxyServer : IAsyncDisposable
         catch (UpstreamUnavailableException ex)
         {
             _statistics.AddError();
+            _statistics.NoteFailure(uri.Host);
             await WriteErrorAsync(clientStream, 502, "Bad Gateway", ex.Message, token).ConfigureAwait(false);
             return;
         }
         catch (Exception ex) when (ex is SocketException or IOException or TimeoutException)
         {
             _statistics.AddError();
+            _statistics.NoteFailure(uri.Host);
             await WriteErrorAsync(clientStream, 502, "Bad Gateway", $"{uri.Host}:{uri.Port} 建连失败：{ex.Message}", token)
                 .ConfigureAwait(false);
             return;
         }
 
+        _statistics.AddConnectSample((int)connectWatch.ElapsedMilliseconds);
+
         using (upstream)
         {
+            TuneSocket(upstream.Client);
+
             var upstreamStream = upstream.GetStream();
 
             var request = new StringBuilder(512);
@@ -454,21 +494,24 @@ public sealed class ProxyServer : IAsyncDisposable
                 await clientStream.FlushAsync(token).ConfigureAwait(false);
             }
 
+            long uploaded = 0;
+
             if (head.IsChunked)
             {
-                await CopyChunkedAsync(clientInput, upstreamStream, token).ConfigureAwait(false);
+                uploaded = await CopyChunkedAsync(clientInput, upstreamStream, token).ConfigureAwait(false);
             }
             else if (head.ContentLength is { } contentLength && contentLength > 0)
             {
-                await CopyExactlyAsync(clientInput, upstreamStream, contentLength, token).ConfigureAwait(false);
+                uploaded = await CopyExactlyAsync(clientInput, upstreamStream, contentLength, token).ConfigureAwait(false);
             }
+
+            _statistics.AddBytesUploaded(uploaded);
 
             await upstreamStream.FlushAsync(token).ConfigureAwait(false);
 
             // 响应按原始 framing 直接回灌（chunked 保持 chunked），并带空闲超时，
             // 避免上游无视 Connection: close 时把连接吊死。
-            await PumpAsync(upstreamStream, clientStream, ResponseIdleMs, token).ConfigureAwait(false);
-            await clientStream.FlushAsync(token).ConfigureAwait(false);
+            await PumpAsync(upstreamStream, clientStream, ResponseIdleMs, upload: false, token).ConfigureAwait(false);            await clientStream.FlushAsync(token).ConfigureAwait(false);
         }
     }
 
@@ -626,18 +669,30 @@ public sealed class ProxyServer : IAsyncDisposable
 
     // ── 转发 ────────────────────────────────────────────────────────────
 
-    private static async Task RelayAsync(Stream clientIn, Stream clientOut, Stream upstream, CancellationToken token)
+    /// <summary>
+    /// 双向转发。任一侧先 EOF 时只做<b>半关闭</b>（Shutdown(Send)），保留反方向继续传输 ——
+    /// 否则「客户端上传完就关写端」会把还在返回数据的上游连接一起掐死（大文件下载尾部丢失）。
+    /// </summary>
+    private async Task RelayAsync(
+        TcpClient client,
+        Stream clientStream,
+        TcpClient upstream,
+        Stream upstreamStream,
+        CancellationToken token)
     {
         using var scope = CancellationTokenSource.CreateLinkedTokenSource(token);
 
-        static async Task Guard(Func<Task> body, CancellationTokenSource scope)
+        async Task HalfAsync(Stream from, Stream to, TcpClient toSocket, bool upload)
         {
+            bool eof;
+
             try
             {
-                await body().ConfigureAwait(false);
+                eof = await PumpAsync(from, to, TunnelIdleMs, upload, scope.Token).ConfigureAwait(false);
             }
             catch
             {
+                // 任意方向出错就整体结束，避免一侧已断另一侧还在空转
                 try
                 {
                     scope.Cancel();
@@ -646,72 +701,136 @@ public sealed class ProxyServer : IAsyncDisposable
                 {
                     // ignore
                 }
-            }
-        }
 
-        await Task.WhenAll(
-                Guard(() => PumpAsync(clientIn, upstream, TunnelIdleMs, scope.Token), scope),
-                Guard(() => PumpAsync(upstream, clientOut, TunnelIdleMs, scope.Token), scope))
-            .ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// 单向泵：任意方向先 EOF 时只结束本方向（半关闭），另一方向继续，直到两边都没数据或空闲超时。
-    /// </summary>
-    private static async Task PumpAsync(Stream source, Stream target, int idleMs, CancellationToken token)
-    {
-        var buffer = new byte[RelayBufferSize];
-
-        while (true)
-        {
-            int read;
-
-            using (var idle = CancellationTokenSource.CreateLinkedTokenSource(token))
-            {
-                idle.CancelAfter(idleMs);
-                read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), idle.Token).ConfigureAwait(false);
+                return;
             }
 
-            if (read <= 0)
+            // 只有「对端真的关了写端」才做半关闭。
+            // 空闲超时不能发 FIN：客户端长时间只收不发（大文件下载）时，
+            // 提前把上游写端关掉会让服务端直接结束响应。
+            if (!eof)
             {
                 return;
             }
 
-            await target.WriteAsync(buffer.AsMemory(0, read), token).ConfigureAwait(false);
-            await target.FlushAsync(token).ConfigureAwait(false);
+            try
+            {
+                toSocket.Client.Shutdown(SocketShutdown.Send);
+            }
+            catch
+            {
+                // 对端可能已经彻底关闭，属正常
+            }
+        }
+
+        await Task.WhenAll(
+                HalfAsync(clientStream, upstreamStream, upstream, upload: true),
+                HalfAsync(upstreamStream, clientStream, client, upload: false))
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 单向泵。返回 true 表示读到 EOF（对端正常关了写端），false 表示空闲超时。
+    /// 这个区分很关键：只有真 EOF 才应该对上游做半关闭。
+    ///
+    /// 空闲超时用「可重置的 CancelAfter」：每读到数据就重置计时，
+    /// 不再像旧实现那样每次 Read 都创建一个 linked CTS（大文件传输时这是每秒上万次分配）。
+    /// </summary>
+    private async Task<bool> PumpAsync(Stream source, Stream target, int idleMs, bool upload, CancellationToken token)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(RelayBufferSize);
+
+        using var idle = CancellationTokenSource.CreateLinkedTokenSource(token);
+        idle.CancelAfter(idleMs);
+
+        try
+        {
+            while (true)
+            {
+                int read;
+
+                try
+                {
+                    read = await source.ReadAsync(buffer.AsMemory(0, RelayBufferSize), idle.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                {
+                    // 空闲超时：本方向结束，但不代表对端不再需要另一方向
+                    return false;
+                }
+
+                if (read <= 0)
+                {
+                    return true;
+                }
+
+                // 重置空闲计时
+                idle.CancelAfter(idleMs);
+
+                await target.WriteAsync(buffer.AsMemory(0, read), token).ConfigureAwait(false);
+
+                if (upload)
+                {
+                    _statistics.AddBytesUploaded(read);
+                }
+                else
+                {
+                    _statistics.AddBytesDownloaded(read);
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
-    internal static async Task CopyExactlyAsync(Stream source, Stream target, long count, CancellationToken token)
+    internal static async Task<long> CopyExactlyAsync(Stream source, Stream target, long count, CancellationToken token)
     {
-        var buffer = new byte[RelayBufferSize];
+        var buffer = ArrayPool<byte>.Shared.Rent(RelayBufferSize);
         var remaining = count;
+        long total = 0;
 
-        while (remaining > 0)
+        try
         {
-            var want = (int)Math.Min(buffer.Length, remaining);
-            var read = await source.ReadAsync(buffer.AsMemory(0, want), token).ConfigureAwait(false);
-
-            if (read <= 0)
+            while (remaining > 0)
             {
-                throw new ProxyProtocolException("请求体长度不足");
-            }
+                var want = (int)Math.Min(RelayBufferSize, remaining);
+                var read = await source.ReadAsync(buffer.AsMemory(0, want), token).ConfigureAwait(false);
 
-            await target.WriteAsync(buffer.AsMemory(0, read), token).ConfigureAwait(false);
-            remaining -= read;
+                if (read <= 0)
+                {
+                    throw new ProxyProtocolException("请求体长度不足");
+                }
+
+                await target.WriteAsync(buffer.AsMemory(0, read), token).ConfigureAwait(false);
+                remaining -= read;
+                total += read;
+            }
         }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+
+        return total;
     }
 
     /// <summary>
     /// 逐块转发 chunked 请求体。校验点（缺一不可）：
     /// 长度行必须是合法十六进制且不超上限、每块数据后必须紧跟 CRLF、末块后必须有结束空行、尾部头长度受限。
     /// 任何一处不满足都立刻 400，绝不把半个帧写进上游。
+    ///
+    /// 读取统一走 <see cref="LineBufferedStream"/>：预读到的正文不会丢，尺寸行也不必逐字节系统调用。
     /// </summary>
-    internal static async Task CopyChunkedAsync(Stream source, Stream target, CancellationToken token)
+    internal static async Task<long> CopyChunkedAsync(Stream source, Stream target, CancellationToken token)
     {
+        using var buffered = new LineBufferedStream(source, leaveOpen: true);
+        long total = 0;
+
         while (true)
         {
-            var line = await ReadCrlfLineAsync(source, token).ConfigureAwait(false)
+            var line = await ReadCrlfLineAsync(buffered, token).ConfigureAwait(false)
                        ?? throw new ProxyProtocolException("分块请求体不完整");
 
             var size = ParseChunkSize(line);
@@ -719,16 +838,16 @@ public sealed class ProxyServer : IAsyncDisposable
 
             if (size == 0)
             {
-                await CopyTrailersAsync(source, target, token).ConfigureAwait(false);
-                return;
+                await CopyTrailersAsync(buffered, target, token).ConfigureAwait(false);
+                return total;
             }
 
-            await CopyExactlyAsync(source, target, size, token).ConfigureAwait(false);
-            await CopyCrlfAsync(source, target, token).ConfigureAwait(false);
+            total += await CopyExactlyAsync(buffered, target, size, token).ConfigureAwait(false);
+            await CopyCrlfAsync(buffered, target, token).ConfigureAwait(false);
         }
     }
 
-    private static async Task CopyTrailersAsync(Stream source, Stream target, CancellationToken token)
+    private static async Task CopyTrailersAsync(LineBufferedStream source, Stream target, CancellationToken token)
     {
         var budget = MaxTrailerBytes;
 
@@ -821,43 +940,71 @@ public sealed class ProxyServer : IAsyncDisposable
     }
 
     /// <summary>只接受 CRLF 结尾的行。裸 LF 会让上游把两行当成一行，属于必须拒绝的帧错误。</summary>
-    private static async Task<string?> ReadCrlfLineAsync(Stream stream, CancellationToken token)
+    private static async Task<string?> ReadCrlfLineAsync(LineBufferedStream source, CancellationToken token)
     {
-        var builder = new StringBuilder(16);
-        var one = new byte[1];
+        var buffer = ArrayPool<byte>.Shared.Rent(256);
 
-        while (true)
+        try
         {
-            var read = await stream.ReadAsync(one.AsMemory(0, 1), token).ConfigureAwait(false);
-            if (read <= 0)
-            {
-                return null;
-            }
+            var length = 0;
 
-            var value = one[0];
-
-            if (value == (byte)'\n')
+            while (true)
             {
-                var text = builder.ToString();
-                if (text.Length == 0 || text[^1] != '\r')
+                var value = await source.ReadByteAsync(token).ConfigureAwait(false);
+
+                if (value < 0)
                 {
-                    throw new ProxyProtocolException("分块行必须以 CRLF 结束");
+                    return null;
                 }
 
-                return text[..^1];
-            }
+                if (value == '\n')
+                {
+                    if (length == 0 || buffer[length - 1] != (byte)'\r')
+                    {
+                        throw new ProxyProtocolException("分块行必须以 CRLF 结束");
+                    }
 
-            builder.Append((char)value);
+                    return Encoding.ASCII.GetString(buffer, 0, length - 1);
+                }
 
-            if (builder.Length > MaxChunkLineLength)
-            {
-                throw new ProxyProtocolException("分块行过长");
+                if (length >= buffer.Length)
+                {
+                    if (buffer.Length >= MaxChunkLineLength)
+                    {
+                        throw new ProxyProtocolException("分块行过长");
+                    }
+
+                    // 扩容（极少发生：正常尺寸行只有几个字符）
+                    var bigger = ArrayPool<byte>.Shared.Rent(Math.Min(MaxChunkLineLength, buffer.Length * 4));
+                    Array.Copy(buffer, bigger, length);
+                    ArrayPool<byte>.Shared.Return(buffer);
+                    buffer = bigger;
+                }
+
+                buffer[length++] = (byte)value;
             }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
     private static ValueTask WriteLineAsync(Stream stream, string line, CancellationToken token) =>
         ProxyProtocol.WriteAsciiAsync(stream, line + "\r\n", token);
+
+    private static void TuneSocket(Socket socket)
+    {
+        try
+        {
+            socket.SendBufferSize = SocketBufferBytes;
+            socket.ReceiveBufferSize = SocketBufferBytes;
+        }
+        catch
+        {
+            // 部分系统策略下不允许调整，忽略
+        }
+    }
 
     private static async Task WriteErrorAsync(
         Stream stream,

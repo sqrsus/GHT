@@ -3,6 +3,9 @@ namespace GHT.Services;
 /// <summary>托盘图标与右键菜单（WinForms NotifyIcon，WPF 自身不提供托盘）。</summary>
 public sealed class TrayIconService : IDisposable
 {
+    /// <summary>Windows 对托盘提示文本的限制约 63 字符，超长会抛异常。</summary>
+    private const int MaxTooltipLength = 63;
+
     private readonly System.Windows.Forms.NotifyIcon _icon;
     private readonly System.Windows.Forms.ToolStripMenuItem _toggleItem;
 
@@ -35,11 +38,34 @@ public sealed class TrayIconService : IDisposable
         _icon.DoubleClick += (_, _) => onShow();
     }
 
-    public void SetState(bool running, string detail)
+    /// <summary>
+    /// 更新托盘状态。<paramref name="speed"/> 传实时吞吐（可为空），
+    /// 空的时候只显示运行状态，避免每秒都改一次托盘文本（部分系统会闪）。
+    /// </summary>
+    public void SetState(bool running, string detail, string? speed = null)
     {
-        var text = $"GHT - {(running ? "运行中" : "已停止")} {detail}".Trim();
-        _icon.Text = text.Length <= 63 ? text : text[..63];
+        var text = $"GHT - {(running ? "运行中" : "已停止")} {detail}";
+        if (!string.IsNullOrEmpty(speed))
+        {
+            text = $"{text} {speed}";
+        }
+
+        text = text.Trim();
+        _icon.Text = text.Length <= MaxTooltipLength ? text : text[..MaxTooltipLength];
         _toggleItem.Text = running ? "停止加速" : "启动加速";
+    }
+
+    /// <summary>气泡提示：启动失败、代理残留恢复这类「用户不看主窗口也需要知道」的事件。</summary>
+    public void Notify(string title, string message)
+    {
+        try
+        {
+            _icon.ShowBalloonTip(4000, title, message, System.Windows.Forms.ToolTipIcon.Info);
+        }
+        catch
+        {
+            // 气泡失败不影响主流程
+        }
     }
 
     public void Dispose()

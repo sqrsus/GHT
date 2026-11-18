@@ -60,6 +60,9 @@ public partial class App : Application
         _singleInstance?.Dispose();
         Log?.Info("GHT 退出");
 
+        // 日志改为异步批量落盘，这里必须等队列写完，否则退出原因那一行会丢
+        Log?.Dispose();
+
         base.OnExit(e);
     }
 
