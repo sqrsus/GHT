@@ -1,6 +1,6 @@
 name: release
 
-# 只有打 v* 标签时才发布（例：git tag v1.0.0 && git push origin v1.0.0）
+# 只有打 v* 标签时才发布（例：git tag v1.3.1 && git push origin v1.3.1）
 on:
   push:
     tags:
@@ -22,10 +22,44 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      # 放在最前面：标签与版本不一致时，不该先花几分钟编译再失败
+      - name: 校验标签与程序集版本一致
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'.TrimStart('v')
+          $version = ([xml](Get-Content 'src/GHT/GHT.csproj' -Raw)).Project.PropertyGroup.Version |
+            Where-Object { $_ } | Select-Object -First 1
+
+          Write-Host "tag = $tag / csproj Version = $version"
+
+          if ($tag -ne $version) {
+            throw "标签 ${{ github.ref_name }} 与 csproj Version=$version 不一致：请先改版本号再打标签"
+          }
+
       - name: 安装 .NET 8 SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
+
+      - name: 还原依赖
+        run: dotnet restore GHT.sln
+
+      - name: 依赖漏洞扫描
+        shell: pwsh
+        run: |
+          $output = dotnet list GHT.sln package --vulnerable --include-transitive 2>&1 | Out-String
+          Write-Host $output
+
+          if ($output -match 'has the following vulnerable packages') {
+            throw '存在已知漏洞的直接或传递依赖，拒绝发布'
+          }
+
+      - name: 编译（Release）
+        run: dotnet build GHT.sln -c Release --no-restore
+
+      # 发布前必须绿：release 分支的产物不允许跳过测试
+      - name: 运行单元与集成测试
+        run: dotnet test tests/GHT.Tests/GHT.Tests.csproj -c Release --no-build --logger "console;verbosity=normal"
 
       - name: 发布单文件 exe（框架依赖）
         # 注意：EnableCompressionInSingleFile 仅在 self-contained 下可用（NETSDK1176），
@@ -41,6 +75,33 @@ jobs:
           -p:DebugSymbols=false
           -o dist
 
+      - name: 校验产物与版本资源
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist/GHT.exe')) {
+            throw '发布产物中缺少 GHT.exe'
+          }
+
+          $version = ([xml](Get-Content 'src/GHT/GHT.csproj' -Raw)).Project.PropertyGroup.Version |
+            Where-Object { $_ } | Select-Object -First 1
+
+          $info = (Get-Item 'dist/GHT.exe').VersionInfo
+          if (-not $info.FileVersion.StartsWith($version)) {
+            throw "产物 FileVersion=$($info.FileVersion) 与 csproj Version=$version 不一致"
+          }
+
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: 生成 SHA256 清单
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash 'dist/GHT.exe' -Algorithm SHA256).Hash
+          "SHA256 (GHT.exe) = $hash" | Tee-Object -FilePath 'dist/SHA256SUMS.txt'
+
+          # 说明哈希的用途：用户下载后可自行校验，无需信任下载渠道的完整性
+          ''
+          'Verify: certutil -hashfile GHT.exe SHA256' | Tee-Object -FilePath 'dist/SHA256SUMS.txt' -Append
+
       - name: 打包 zip
         shell: pwsh
         run: |
@@ -54,7 +115,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 产物未做代码签名（仓库里没有可用的签名证书）：因此同时附上 SHA256 清单，
+          # 让用户能独立校验下载到的文件与构建产物一致。要启用签名，需在仓库 secrets
+          # 中配置证书并用 signtool 在发布前签名，未配置前不做「假签名」。
           gh release create "${{ github.ref_name }}" `
             "GHT-${{ github.ref_name }}-win-x64.zip" `
+            "dist/SHA256SUMS.txt" `
             --title "GHT ${{ github.ref_name }}" `
             --generate-notes

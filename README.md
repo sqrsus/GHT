@@ -44,10 +44,11 @@ GHT 是一个 Windows 桌面小工具：在本机开一个 HTTP 代理，**只�
 
 四条关键设计：
 
-1. **首连预算（默认 1500ms）只包住「选路」**，不包住数据转发。预算到点就先用系统 DNS 连上，DNS 扫描在后台继续，下一个请求即可命中新结果——不会出现「明明能直连却报 502」，也不会掐断长下载。
+1. **首连预算（默认 3000ms）只包住「选路」**，不包住数据转发。预算到点就先用系统 DNS 连上，DNS 扫描在后台继续，下一个请求即可命中新结果——不会出现「明明能直连却报 502」，也不会掐断长下载。
 2. **首批候选是真正的时间窗口**：任一 DNS 查询一返回就合并结果并尝试发布，另有独立计时器到点强制发布；首批只问延迟低、近期成功率高的前若干台，其余交给后台 worker 补齐。不会因为「这一批里有一台 DNS 慢」就把整个窗口拖到单次 DNS 超时。
 3. **扫描任务不接调用方的取消令牌**。调用方放弃等待 ≠ 扫描被取消。
 4. **回落按原因分项计数**：池为空 / 预算到期 / 无解析答案 / 候选全失败，四种情况的修法完全不同。候选全部建连失败时默认再用系统 DNS 兜底（`FallbackOnCandidatesFailed`，可关）；严格语义下才回 502。
+5. **停止是「有界收尾」而不是「关掉监听就跑」**：接入的每条连接都被登记（含上游 socket），停止时先取消共享令牌让它们自行退出，超时（3s）后强制关闭两端。这样停止返回后不会再有隧道在转发，健康度与日志也一定能写在大退出之前。
 
 ### 转发层的性能取舍
 
@@ -97,20 +98,32 @@ dotnet publish src/GHT/GHT.csproj -c Release -r win-x64 --self-contained false `
 > `PublishTrimmed` 必须保持关闭：WPF 不支持裁剪。
 > 框架依赖（`--self-contained false`）时也不能开 `EnableCompressionInSingleFile`，SDK 会报 NETSDK1176。
 
-测试工程 `tests/GHT.Tests` 只编译「不依赖 Windows API 的纯逻辑源码」（HTTP 解析、chunked 帧、DNS 报文、白名单、配置归一化），因此可以在 Linux/WSL 上直接 `dotnet test`，不必等到 Windows runner。
+测试工程 `tests/GHT.Tests` 分两类：
+
+- **纯逻辑单测**：链接不依赖 Windows API 的源码（HTTP 解析、chunked 帧、DNS 报文、白名单、配置归一化、竞速健康度、扫描上下文），可在 Linux/WSL 上直接 `dotnet test`；
+- **网络边界集成测试**：直接驱动真实的 `ProxyServer` 与本机回环上的假上游，覆盖明文转发、CONNECT 隧道、畸形头、超长请求、畸形 chunked、`Expect: 100-continue`、双端提前关闭、启停与端口占用。上游不依赖外网，CI 上同样可跑。
+
+`dotnet test` 全部用例在 Linux 与 Windows 上都必须绿；测试不依赖操作系统的 TCP 行为（例如「连接关闭端口多久返回 RST」在 Windows 上是 2s、Linux 上是 1ms，这类差异被建连注入隔离掉了）。
 
 ---
 
 ## 四、配置项
 
 配置保存在 `%LOCALAPPDATA%\GHT\settings.json`，改完保存即生效，无需重启程序。
-保存采用「唯一临时文件 → 留一份 `settings.json.bak` → 原子替换」，并加了保存锁；读取失败时会自动回退到 `.bak`。
+
+写入走「唯一临时文件 → `Flush(flushToDisk: true)` 强刷 → 备份为 `.bak` → 原子替换（`File.Replace`，不支持时退化为覆盖移动）→ 失败则用备份恢复」，并用锁串行化并发保存。几个刻意的取舍：
+
+- **先刷盘再替换**：`File.WriteAllText` 只把数据交给系统缓存，强杀或断电会留下「长度对了、内容是零」的半截 JSON。现在目标文件在被替换前始终是完整的旧内容，最坏只丢最后一次修改。
+- **备份失败要留痕**：`TryBackup` 失败只警告、不阻断保存，但会写进日志 —— 「以为有备份、其实没有」比「明确知道没有」危险。
+- **未知字段忽略但记日志**：旧版本配置可以直接继续用，字段名拼错时至少能在日志里看到痕迹。
+- **结构严格**：根节点必须是对象、`MaxDepth` 限制为 32，读到 `[1,2,3]` 这类内容会整体拒绝并回退备份，而不是「读到一半当成配置」。
+
 若本机存在旧版 `%LOCALAPPDATA%\CloudflareSmartProxy\settings.json`，首次启动会自动复制一份过来（不覆盖已有文件）。
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `ProxyPort` | `7890` | 本地监听端口，仅绑定 `127.0.0.1` |
-| `GlobalDnsWhitelist` | GitHub 相关 16 条 | 逗号或换行分隔，支持 `*` 通配；**可清空**，清空即全部走系统 DNS |
+| `GlobalDnsWhitelist` | GitHub 相关 16 条 | 逗号/分号/换行分隔，支持 `*.` 前缀通配；**可清空**，清空即全部走系统 DNS。只接受主机名（字母数字与 `.-_`），误贴的 `https://…`、`host:port`、带路径的条目会被丢弃；最多 256 条 |
 | `DnsAccelEnabled` | `true` | 总开关 |
 | `ConnectBudgetMs` | `3000` | 首连预算；`0` = 不限（等价旧行为，作为回滚开关）。应略大于单个地址的失败耗时，否则竞速会被掐断而给不出结论 |
 | `FallbackOnCandidatesFailed` | `true` | 加速池候选全部连不上时，再用系统 DNS 兜底；`false` = 直接 502（严格语义） |
@@ -158,7 +171,8 @@ src/GHT/
     ├── Http/                  请求头解析、前置缓冲流、带缓冲的行读取流
     ├── Dns/                   DNS 报文编解码、UDP 客户端、扫描器、结果缓存、地址合法性判定、内置清单
     ├── SystemProxy.cs         系统代理注册表读写 + WinINet 刷新
-    ├── SettingsStore.cs       配置读写与越界收敛
+    ├── SettingsStore.cs       配置读写（强刷 + 原子替换 + 回滚 + 白名单清洗）
+    ├── RuntimeGuard.cs        运行环境检查（Windows 版本下限、运行时与架构摘要）
     ├── SingleInstance.cs      Mutex + 命名管道唤出
     ├── TrayIconService.cs     托盘图标、菜单与气泡
     ├── AutoStart.cs           开机自启
@@ -166,9 +180,11 @@ src/GHT/
     ├── DomainWildcardList.cs  通配域名匹配
     └── LogService.cs          异步批量落盘 + 按天分文件 + 大小轮转 + 内存缓冲
 
-tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平台运行）
-└── HttpHead / ChunkedBody / DnsMessage / DnsResultCache / AddressPolicy / ResolverHub
-    / UpstreamRacer / ProxyStatistics / LogService / DomainWildcardList / Settings
+tests/GHT.Tests/               单元测试 + 网络边界集成测试（链接源码，可跨平台运行）
+├── 单元：HttpHead / ChunkedBody / DnsMessage / DnsResultCache / AddressPolicy / ResolverHub
+│         / SweepRace / UpstreamRacer / ProxyStatistics / LogService / SettingsStore
+│         / DomainWildcardList / RuntimeGuard
+└── 集成：ProxyLifecycle / ProxyProtocolIntegration / LogPrivacy（真实 socket + 本机假上游）
 ```
 
 ---
@@ -177,15 +193,20 @@ tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平�
 
 | 工作流 | 触发 | 做了什么 |
 |---|---|---|
-| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（133 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
-| `release.yml` | 推送 `v*` 标签 | 同上构建，打包 zip 并创建 GitHub Release |
+| `build.yml` | push / PR 到 `main`、手动 | restore → **依赖漏洞扫描** → build → **dotnet test（182 例）** → publish 单文件 exe → **校验 exe 版本资源与 csproj 一致** → 生成 `SHA256SUMS.txt` → 上传 `GHT-win-x64` artifact |
+| `release.yml` | 推送 `v*` 标签 | **校验标签与程序集版本一致**（不一致直接失败）→ 漏洞扫描 → build → test → publish → 校验版本资源 → 生成 SHA256 → 打包 zip → 创建 Release（附 zip 与 `SHA256SUMS.txt`） |
+
+`build.yml` 支持手动触发时勾选「独立部署」：产物改为 `--self-contained true` 并开启压缩，用户无需预装 .NET 桌面运行时；代价是单文件体积显著变大，因此默认仍走框架依赖。
 
 发布新版本：
 
 ```bash
-git tag v1.3.1
-git push origin v1.3.1
+# csproj 里的 <Version> 必须与标签一致，否则 release.yml 第一步就会失败
+git tag v1.4.0
+git push origin v1.4.0
 ```
+
+> **关于签名**：仓库里没有可用的代码签名证书，因此产物**未做签名**。作为替代，Release 附带 `SHA256SUMS.txt`，下载后可自行校验（`certutil -hashfile GHT.exe SHA256`）。要做可信发布，需要在 secrets 里配置证书并在发布前用 `signtool` 签名 —— 在没有证书的情况下伪造「签名流程」只会给用户错误的安全感，所以这里明确留空。
 
 ---
 
@@ -197,9 +218,19 @@ git push origin v1.3.1
 
 投毒/被劫持的公共 DNS 会返回 `127.0.0.1`、`0.0.0.0`、`198.51.44.8`（TEST-NET-2）这类地址。它们「答得很积极」，于是永远排在首批，而答案永远连不上 —— 一批 8 个竞速名额就这样被白白占掉。过滤范围只限明确不可路由的段（回环、未指定、私有、CGNAT、链路本地、文档段、组播、保留段；IPv6 只收 `2000::/3`），**不**做「看着像内网就丢」的猜测：`20.x.x.x`、`185.199.x.x` 是 GitHub 自己的入口，误杀会直接断掉加速。
 
-**2. 「答错」的责任归到那台 DNS 上**
+**2. 「答错」的责任归到那台 DNS 上，并按证据强度加权、随时间衰减**
 
-`ResolverHub` 记录「候选 IP → 首个给出它的 DNS」。竞速判定某地址连不上时，通过 `ReportBadAnswer` 给该 DNS 记一次失败（独立的 `Bad` 计数），排序时按**双倍权重**参与降级判定。效果是「答得出且答得对」的 DNS 会逐渐顶替「答得出但答错」的。只降权、不剔除：池里若全是劣质 DNS，直接剔除会让人彻底连不上。
+`ResolverHub` 记录「候选 IP → 首个给出它的 DNS」。竞速判定某地址连不上时通过 `ReportBadAnswer(地址, 失败类型)` 回灌，但三类失败的权重完全不同：
+
+| 失败类型 | 含义 | 权重 | 半衰期 |
+|---|---|---|---|
+| 投毒（应答全被地址过滤拦下） | DNS 明确在返回不可路由地址 | 2.0 | 30 分钟 |
+| `Refused`（对方回 RST） | 地址是活的，但不管这个域名 —— 答案错了 | 1.5 | 30 分钟 |
+| `Timeout` / `Unreachable` | 可能只是本机链路抖动，也可能是地址不可达 | 1.0 | 10 分钟 |
+
+打分是 `加权负面分 > 1 + 正向分` 才降级，那个 `1` 是刻意留的余量：**单次超时不该让一台好 DNS 掉到队尾**。所有分数按时间指数衰减，因此一次历史失败会随好表现被冲淡 —— 健康度有「有效期」，不需要人工重置。只降权、不剔除：池里若全是劣质 DNS，直接剔除会让人彻底连不上。
+
+> 这里修掉过一个真实误判：`UpstreamRacer` 原本把「单地址超时」和「整批预算到期」共用一个取消令牌，于是超时会被当成「我们自己决定不试了」，既不上报也不计入健康度。现在每次尝试有自己的超时令牌，两者在 `catch` 上分流。
 
 **3. 地址健康度跨进程存活**（`%LOCALAPPDATA%\GHT\address-health.json`）
 
@@ -208,13 +239,21 @@ git push origin v1.3.1
 另外两个与预算直接相关的修正：
 
 - **预算取消不再记为地址失败**。旧实现里竞速胜出后 `scope.Cancel()` 会让其余候选全部走进 `catch` 并各记一次失败，好地址被反复记失败，健康度被系统性污染。现在取消与真实失败在 `catch (OperationCanceledException) when (token.IsCancellationRequested)` 上分流。
-- **预算用尽时打印失败明细**：候选数、失败个数、耗时区间与前几个 `IP(xxms)`。这三个数字能把「上游不可达（2000ms+）」「投毒地址（几十毫秒 ConnectionRefused）」「预算确实太小（失败列表为空）」三种情况分开。
+- **预算用尽时打印失败明细**：候选数、失败个数、耗时区间与前几个 `IP(类型,xxms)`。这三个数字能把「上游不可达（2000ms+）」「投毒地址（几十毫秒 Refused）」「预算确实太小（失败列表为空）」三种情况分开。
+
+**4. 一次扫描的状态是显式上下文**（`ResolverHub.SweepContext`）
+
+host、池版本、候选表、首批发布状态打包进一个对象，发布判定与缓存合并放在**同一把锁**里。旧实现把 `found` / `seen` / `published` 散成闭包捕获的局部变量，缓存合并在锁外，于是「换池 / 首批发布 / 截止计时器同时触发」时可能出现「缓存里已有、首批快照里没有」的中间态。扫描键也带上池版本（`host#generation`），换池后旧扫描的结果一律丢弃，新请求不会复用一个注定作废的扫描。
 
 ---
 
 ## 八、已知边界
 
-- **仅 Windows 10/11 x64**：WPF + 注册表 + 托盘，跨平台需重写宿主层。
+- **仅 Windows 10（build 17763）及以上 x64**：WPF + 注册表 + 托盘，跨平台需重写宿主层。启动时 `RuntimeGuard` 会检查系统版本与运行时并在不满足时给出可读提示（而不是崩在某个 P/Invoke 上）。
+- **框架依赖发布需要 .NET 8 桌面运行时**：没装时系统会弹「需要 .NET」，或可改用手动触发的独立部署构建（无需预装，体积明显更大）。
+- **产物未做代码签名**：Release 附 `SHA256SUMS.txt` 供自行校验；可信签名需要证书，仓库里没有。
+- **Windows 专属面没有自动化覆盖**：注册表代理读写、托盘、WPF 生命周期、`SingleInstance` 命名管道只有人工验证路径。自动化的边界明确停在「网络协议层」——集成测试覆盖的是代理与控制连接本身。
+- **停止最多阻塞数秒**：`StopAsync`（以及退出时的 `Cleanup`）会等活跃连接退出，上限 3s + 0.5s 宽限；正常情况连接在取消后毫秒级结束。
 - **仅 HTTP/1.1**：不支持 h2，浏览器会对代理自动降级。
 - **明文 HTTP 采用「一次连接一个请求」**：向上游强制 `Connection: close`，换取转发逻辑的绝对可靠；HTTPS 走隧道不受影响。
 - **明文 HTTP 的帧是严格校验的**：只接受 chunked 与定长两种请求体；畸形头、折行头、重复且冲突的 `Content-Length`、非 chunked 结尾的 `Transfer-Encoding`、缺 CRLF 的分块一律回 400，不做「猜着转发」。

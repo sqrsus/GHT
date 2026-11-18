@@ -28,6 +28,8 @@ internal delegate Task<DnsQueryResult?> DnsQueryHandler(
 /// 4) 首批发布是<b>真正的时间窗口</b>：由「任一查询完成」或「独立截止计时器」触发，
 ///    不依赖某一批 <c>Task.WhenAll</c> 结束。旧实现要等整批 DNS 都返回才检查窗口，
 ///    只要批里有一台慢，首批就被拖到单次 DNS 超时附近，把整个首连预算吃掉。
+/// 5) 一次扫描的所有可变状态都装在 <see cref="SweepContext"/> 里，发布与缓存合并在同一把锁内，
+///    换池 / 首批发布 / 截止计时器同时触发时不会再出现「缓存有、候选表没有」的中间态。
 /// </summary>
 public sealed class ResolverHub
 {
@@ -37,10 +39,37 @@ public sealed class ResolverHub
     /// <summary>后台补齐的目标候选数。到量即停，避免为一个域名把上千台 DNS 全问一遍。</summary>
     private const int BackgroundTargetIps = 16;
 
+    /// <summary>映射表的软上限。地址集合本身有限，这里只是防止长期运行后无限增长。</summary>
+    private const int IpSourceSoftLimit = 8192;
+
+    // ── 健康度权重与半衰期 ──────────────────────────────────────────────
+    // 三类负面信号的证据强度完全不同，混成一个计数器就是把「网线被拔」和「DNS 投毒」当成一回事：
+    //   投毒（应答全是不可路由地址）：最强的证据，权重 2，半衰期 30 分钟；
+    //   RST（地址可达但拒绝服务）  ：较强，权重 1.5，半衰期 30 分钟；
+    //   超时 / 不可达             ：最弱，很可能只是本机链路抖动，权重 1，半衰期 10 分钟。
+    private const double PoisonWeight = 2.0;
+    private const double RefusedWeight = 1.5;
+    private const double SoftWeight = 1.0;
+
+    private static readonly double PoisonHalfLifeMs = TimeSpan.FromMinutes(30).TotalMilliseconds;
+    private static readonly double RefusedHalfLifeMs = TimeSpan.FromMinutes(30).TotalMilliseconds;
+    private static readonly double SoftHalfLifeMs = TimeSpan.FromMinutes(10).TotalMilliseconds;
+    private static readonly double OkHalfLifeMs = TimeSpan.FromMinutes(60).TotalMilliseconds;
+
+    /// <summary>
+    /// 降级门槛：加权负面分要超过「1 + 正向分」才降级。
+    /// 那个 1.0 是刻意留的余量 —— 单次超时不该让一台好 DNS 立刻掉到队尾。
+    /// </summary>
+    private const double DegradeFloor = 1.0;
+
     private readonly LogService _log;
     private readonly DnsQueryHandler _query;
     private readonly DnsResultCache _cache = new();
 
+    /// <summary>
+    /// 在飞的扫描，键是 <c>host#generation</c>。
+    /// 带上版本号是为了让「换池前发起、换池后才返回」的扫描无法被新请求复用。
+    /// </summary>
     private readonly ConcurrentDictionary<string, Lazy<Task<IReadOnlyList<IPAddress>>>> _sweeps =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -61,9 +90,6 @@ public sealed class ResolverHub
     /// 精确记到那台 DNS 上，而不是笼统地让所有 DNS 一起背锅。
     /// </summary>
     private readonly ConcurrentDictionary<IPAddress, string> _ipSource = new();
-
-    /// <summary>映射表的软上限。地址集合本身有限，这里只是防止长期运行后无限增长。</summary>
-    private const int IpSourceSoftLimit = 8192;
 
     private volatile IReadOnlyList<DnsPoolEntry> _pool = Array.Empty<DnsPoolEntry>();
 
@@ -109,9 +135,10 @@ public sealed class ResolverHub
             return (0, 0);
         }
 
-        return (
-            Volatile.Read(ref health.Ok),
-            Volatile.Read(ref health.Fail) + Volatile.Read(ref health.Bad));
+        lock (health)
+        {
+            return (health.OkRaw, health.BadRaw + health.RefusedRaw + health.FailRaw);
+        }
     }
 
     /// <summary>
@@ -119,8 +146,12 @@ public sealed class ResolverHub
     ///
     /// 只影响排序，不影响可用性 —— 被记过的 DNS 仍会参与解析，只是排到后面。
     /// 这是刻意的：池里如果全是劣质 DNS，直接剔除会让人彻底连不上，降权则只是「先用好的」。
+    ///
+    /// <paramref name="kind"/> 决定这条证据的分量：RST 说明「地址是真的、但不管这个域名」，
+    /// 基本可断定答案有问题；超时则可能只是本机链路抖动，权重低且衰减快。
+    /// 把两者混为一谈，会让一次网络抖动把一批好 DNS 永久降权。
     /// </summary>
-    public void ReportBadAnswer(IPAddress? address)
+    public void ReportBadAnswer(IPAddress? address, AddressFailureKind kind)
     {
         if (address is null)
         {
@@ -133,17 +164,80 @@ public sealed class ResolverHub
         }
 
         var health = _serverHealth.GetOrAdd(server, _ => new ServerHealth());
-        Interlocked.Increment(ref health.Bad);
+        var now = Environment.TickCount64;
+
+        lock (health)
+        {
+            switch (kind)
+            {
+                case AddressFailureKind.Refused:
+                    health.RefusedRaw++;
+                    health.RefusedScore = Decay(health.RefusedScore, health.RefusedStamp, now, RefusedHalfLifeMs) + 1;
+                    health.RefusedStamp = now;
+                    break;
+
+                case AddressFailureKind.Timeout:
+                case AddressFailureKind.Unreachable:
+                case AddressFailureKind.Other:
+                default:
+                    health.FailRaw++;
+                    health.FailScore = Decay(health.FailScore, health.FailStamp, now, SoftHalfLifeMs) + 1;
+                    health.FailStamp = now;
+                    break;
+            }
+        }
     }
 
+    /// <summary>
+    /// 单台 DNS 的健康记录。
+    ///
+    /// 原始计数只增不减，只用于 UI 展示（用户看到的是「这台答错过几次」的事实）；
+    /// 选台排序用的是<b>带时间衰减的分数</b>，因此一次历史失败会随好表现逐渐被冲淡，
+    /// 不会让一台 DNS 因为开机时的一次抖动永久排在队尾。
+    /// </summary>
     private sealed class ServerHealth
     {
-        public int Ok;
-        public int Fail;
+        public int OkRaw;
+        public int BadRaw;
+        public int RefusedRaw;
+        public int FailRaw;
 
-        /// <summary>「答了，但答案连不上」的次数。与 Fail 分开计，因为两者含义不同：</summary>
-        /// <remarks>Fail 是答不出（网络不通/超时），Bad 是答了但答错（投毒、污染、过时记录）。</remarks>
-        public int Bad;
+        public double OkScore;
+        public long OkStamp;
+
+        public double BadScore;
+        public long BadStamp;
+
+        public double RefusedScore;
+        public long RefusedStamp;
+
+        public double FailScore;
+        public long FailStamp;
+
+        /// <summary>加权负面分（已衰减）。</summary>
+        public double NegativeScore(long now) =>
+            (Decay(BadScore, BadStamp, now, PoisonHalfLifeMs) * PoisonWeight)
+            + (Decay(RefusedScore, RefusedStamp, now, RefusedHalfLifeMs) * RefusedWeight)
+            + (Decay(FailScore, FailStamp, now, SoftHalfLifeMs) * SoftWeight);
+
+        public double PositiveScore(long now) => Decay(OkScore, OkStamp, now, OkHalfLifeMs);
+    }
+
+    /// <summary>指数衰减：半衰期内值减半。时钟回拨时保持原值，不清零。</summary>
+    private static double Decay(double value, long stampMs, long nowMs, double halfLifeMs)
+    {
+        if (value <= 0)
+        {
+            return 0;
+        }
+
+        var elapsed = nowMs - stampMs;
+        if (elapsed <= 0 || halfLifeMs <= 0)
+        {
+            return value;
+        }
+
+        return value * Math.Pow(0.5, elapsed / halfLifeMs);
     }
 
     public void ApplySettings(AppSettings settings)
@@ -170,6 +264,10 @@ public sealed class ResolverHub
         // 否则淘汰池的结果会通过缓存继续影响到新池。
         Interlocked.Increment(ref _generation);
         _cache.Clear();
+
+        // 在飞的扫描全部属于旧版本，留着只会让新请求复用一个注定丢弃结果的扫描。
+        _sweeps.Clear();
+
         _log.Info($"加速池已更新：{normalized.Length} 个 DNS");
     }
 
@@ -190,13 +288,15 @@ public sealed class ResolverHub
             return cached;
         }
 
+        var generation = Volatile.Read(ref _generation);
+        var key = host + "#" + generation.ToString();
         Task<IReadOnlyList<IPAddress>>? sweep = null;
 
-        if (_sweeps.TryGetValue(host, out var tracked))
+        if (_sweeps.TryGetValue(key, out var tracked))
         {
             if (tracked.Value.IsCompleted)
             {
-                RemoveSweep(host, tracked);
+                RemoveSweep(key, tracked);
             }
             else
             {
@@ -204,93 +304,57 @@ public sealed class ResolverHub
             }
         }
 
-        sweep ??= _sweeps.GetOrAdd(host, CreateSweep).Value;
+        sweep ??= _sweeps.GetOrAdd(key, _ => CreateSweep(host, generation)).Value;
 
         return await sweep.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
     /// 按 key + value 精确移除。并发下另一个调用可能刚把「新任务」放进字典，
-    /// 此时 <c>TryRemove(host)</c> 会把新任务删掉，导致短时间内重复启动扫描。
+    /// 此时 <c>TryRemove(key)</c> 会把新任务删掉，导致短时间内重复启动扫描。
     /// </summary>
-    private void RemoveSweep(string host, Lazy<Task<IReadOnlyList<IPAddress>>> tracked)
+    private void RemoveSweep(string key, Lazy<Task<IReadOnlyList<IPAddress>>> tracked)
     {
         var collection = (ICollection<KeyValuePair<string, Lazy<Task<IReadOnlyList<IPAddress>>>>>)_sweeps;
-        collection.Remove(new KeyValuePair<string, Lazy<Task<IReadOnlyList<IPAddress>>>>(host, tracked));
+        collection.Remove(new KeyValuePair<string, Lazy<Task<IReadOnlyList<IPAddress>>>>(key, tracked));
     }
 
     /// <summary>
     /// 用 <see cref="Lazy{T}"/> 包一层再放进字典：<c>GetOrAdd</c> 的工厂在高并发下可能被调用多次
     /// （只有一份会被保留），如果工厂本身带「启动扫描」的副作用，那些被丢弃的调用就会白扫一遍。
     /// </summary>
-    private Lazy<Task<IReadOnlyList<IPAddress>>> CreateSweep(string host) =>
-        new(() => StartSweep(host), LazyThreadSafetyMode.ExecutionAndPublication);
+    private Lazy<Task<IReadOnlyList<IPAddress>>> CreateSweep(string host, int generation) =>
+        new(() => StartSweep(host, generation), LazyThreadSafetyMode.ExecutionAndPublication);
 
-    private Task<IReadOnlyList<IPAddress>> StartSweep(string host)
+    private Task<IReadOnlyList<IPAddress>> StartSweep(string host, int generation)
     {
-        var firstBatch = new TaskCompletionSource<IReadOnlyList<IPAddress>>(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-
-        var generation = Volatile.Read(ref _generation);
-
-        // 直接启动异步方法：首个 await 前只有建 socket 这类极短的同步工作。
-        // 旧实现用 Task.Run 包一层，调用方本身在池线程时还要再排一次队，白白推迟首批结果。
-        _ = SweepAsync(host, firstBatch, generation);
-
-        return firstBatch.Task;
-    }
-
-    private async Task SweepAsync(
-        string host,
-        TaskCompletionSource<IReadOnlyList<IPAddress>> firstBatch,
-        int generation)
-    {
-        var pool = _pool;
-        if (pool.Count == 0)
-        {
-            _log.Debug($"加速池为空，{host} 直接走系统 DNS");
-            firstBatch.TrySetResult(Array.Empty<IPAddress>());
-            return;
-        }
-
-        var found = new List<IPAddress>(16);
-        var seen = new HashSet<IPAddress>();
-        var published = 0;
-
         var window = Math.Max(0, _firstBatchMs);
 
         // window == 0 表示「不聚合」：拿到第一个答案就返回，但也不能在还没有答案时抢先发布空结果。
         var minIps = window <= 0 ? 1 : Math.Max(1, _firstBatchMinIps);
 
-        // 发布只由两件事触发：任一查询完成（凑够 minIps）、或独立截止计时器到点。
-        void TryPublish(bool force)
+        var context = new SweepContext(this, host, generation, minIps);
+
+        // 直接启动异步方法：首个 await 前只有建 socket 这类极短的同步工作。
+        // 旧实现用 Task.Run 包一层，调用方本身在池线程时还要再排一次队，白白推迟首批结果。
+        _ = SweepAsync(context, window);
+
+        return context.FirstBatch;
+    }
+
+    private async Task SweepAsync(SweepContext context, int window)
+    {
+        var pool = _pool;
+        if (pool.Count == 0)
         {
-            if (Volatile.Read(ref published) != 0)
-            {
-                return;
-            }
-
-            IPAddress[] snapshot;
-
-            lock (found)
-            {
-                if (!force && found.Count < minIps)
-                {
-                    return;
-                }
-
-                snapshot = found.ToArray();
-            }
-
-            if (Interlocked.Exchange(ref published, 1) == 0)
-            {
-                firstBatch.TrySetResult(snapshot);
-            }
+            _log.Debug($"加速池为空，{context.Host} 直接走系统 DNS");
+            context.PublishFinal();
+            return;
         }
 
         using var deadline = new CancellationTokenSource();
         var deadlineTask = window > 0
-            ? PublishOnDeadlineAsync(window, () => TryPublish(force: true), deadline.Token)
+            ? PublishOnDeadlineAsync(window, context.PublishOnWindow, deadline.Token)
             : Task.CompletedTask;
 
         using var guard = new CancellationTokenSource(TimeSpan.FromMilliseconds(Math.Max(4000, _timeoutMs * 8)));
@@ -298,6 +362,7 @@ public sealed class ResolverHub
         try
         {
             var ordered = OrderByHealth(pool);
+            var minIps = context.MinIps;
 
             // 首批只问「延迟低、近期成功率高」的前若干台，其余留给后台。
             var headCount = Math.Min(ordered.Count, Math.Clamp(Math.Max(minIps * 2, 8), 8, FirstBatchServerCap));
@@ -305,14 +370,7 @@ public sealed class ResolverHub
             var head = new Task[headCount];
             for (var i = 0; i < headCount; i++)
             {
-                head[i] = QueryOneAsync(
-                    ordered[i],
-                    host,
-                    found,
-                    seen,
-                    generation,
-                    () => TryPublish(force: false),
-                    guard.Token);
+                head[i] = QueryOneAsync(ordered[i], context, guard.Token);
             }
 
             await Task.WhenAll(head).ConfigureAwait(false);
@@ -322,16 +380,16 @@ public sealed class ResolverHub
             // 否则会把「后面几台能答」的池子直接判死，白白回落系统 DNS。
             if (headCount < ordered.Count)
             {
-                await DrainAsync(ordered, headCount, host, found, seen, generation, guard.Token).ConfigureAwait(false);
+                await DrainAsync(ordered, headCount, context, guard.Token).ConfigureAwait(false);
             }
         }
         catch (Exception ex)
         {
-            _log.Warn($"解析 {host} 失败：{ex.GetType().Name}: {ex.Message}");
+            _log.Warn($"解析 {context.Host} 失败：{ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
-            TryPublish(force: true);
+            context.PublishFinal();
 
             try
             {
@@ -351,10 +409,7 @@ public sealed class ResolverHub
     private async Task DrainAsync(
         IReadOnlyList<DnsPoolEntry> ordered,
         int startIndex,
-        string host,
-        List<IPAddress> found,
-        HashSet<IPAddress> seen,
-        int generation,
+        SweepContext context,
         CancellationToken token)
     {
         var workers = Math.Min(Math.Max(1, _concurrency), ordered.Count - startIndex);
@@ -377,18 +432,18 @@ public sealed class ResolverHub
                     return;
                 }
 
-                if (generation != Volatile.Read(ref _generation))
+                if (context.IsStale)
                 {
                     // 池已换过，本轮结果无意义
                     return;
                 }
 
-                if (CountFound(found) >= BackgroundTargetIps)
+                if (context.Count >= BackgroundTargetIps)
                 {
                     return;
                 }
 
-                await QueryOneAsync(ordered[index], host, found, seen, generation, null, token).ConfigureAwait(false);
+                await QueryOneAsync(ordered[index], context, token).ConfigureAwait(false);
             }
         }
 
@@ -415,14 +470,7 @@ public sealed class ResolverHub
         publish();
     }
 
-    private async Task QueryOneAsync(
-        DnsPoolEntry entry,
-        string host,
-        List<IPAddress> found,
-        HashSet<IPAddress> seen,
-        int generation,
-        Action? onResult,
-        CancellationToken token)
+    private async Task QueryOneAsync(DnsPoolEntry entry, SweepContext context, CancellationToken token)
     {
         if (!IPAddress.TryParse(entry.Ip, out var server))
         {
@@ -436,8 +484,8 @@ public sealed class ResolverHub
             // A 与 AAAA 同时问：纯 IPv6 环境下只查 A 会得到空答案，候选池直接少一半路子。
             var queries = new[]
             {
-                _query(server, host, _timeoutMs, token, false),
-                _query(server, host, _timeoutMs, token, true)
+                _query(server, context.Host, _timeoutMs, token, false),
+                _query(server, context.Host, _timeoutMs, token, true)
             };
 
             answers = await Task.WhenAll(queries).ConfigureAwait(false);
@@ -449,12 +497,12 @@ public sealed class ResolverHub
         }
         catch (Exception ex)
         {
-            RecordHealth(entry.Ip, false);
-            _log.Debug($"{entry.Ip} 解析 {host} 失败：{ex.GetType().Name}");
+            RecordFail(entry.Ip);
+            _log.Debug($"{entry.Ip} 解析 {context.Host} 失败：{ex.GetType().Name}");
             return;
         }
 
-        if (generation != Volatile.Read(ref _generation))
+        if (context.IsStale)
         {
             return;
         }
@@ -485,7 +533,7 @@ public sealed class ResolverHub
             foreach (var address in result.Addresses)
             {
                 // 投毒/污染的应答必须在入池前丢掉，而不是留到竞速阶段靠失败来淘汰：
-                // 它们「失败得很快」反而会占满一批竞速名额，并让 1500ms 的首连预算
+                // 它们「失败得很快」反而会占满一批竞速名额，并让首连预算
                 // 全部消耗在必然失败的地址上。
                 if (!AddressPolicy.IsRoutable(address))
                 {
@@ -501,67 +549,34 @@ public sealed class ResolverHub
         {
             // 「答了但全被过滤」比「没答」更该降权：这说明该 DNS 正在返回不可路由的地址，
             // 下次不该再让它进首批。
-            RecordHealth(entry.Ip, false);
-
             if (answered && rejected > 0)
             {
-                _log.Debug($"{entry.Ip} 对 {host} 的应答全部不可路由（{rejected} 个），已丢弃");
+                RecordPoison(entry.Ip);
+                _log.Debug($"{entry.Ip} 对 {context.Host} 的应答全部不可路由（{rejected} 个），已丢弃");
+            }
+            else
+            {
+                RecordFail(entry.Ip);
             }
 
             return;
         }
 
-        RecordHealth(entry.Ip, true);
+        RecordOk(entry.Ip);
 
-        _cache.Merge(host, addresses, ttl, _preferIpv4);
-
-        // 记录「谁给出了这个地址」，供后续竞速失败时归因。同一地址以首个给出者为准：
-        // 后给出同一答案的 DNS 只是随声附和，不该分享责任。
-        if (_ipSource.Count >= IpSourceSoftLimit)
+        if (context.Accept(entry.Ip, addresses, ttl))
         {
-            _ipSource.Clear();
-        }
-
-        foreach (var address in addresses)
-        {
-            _ipSource.TryAdd(address, entry.Ip);
-        }
-
-        var added = false;
-
-        lock (found)
-        {
-            foreach (var address in addresses)
-            {
-                if (seen.Add(address))
-                {
-                    found.Add(address);
-                    added = true;
-                }
-            }
-
-            if (added)
-            {
-                found.Sort(CompareAddress);
-            }
-        }
-
-        if (added)
-        {
-            onResult?.Invoke();
+            context.PublishIfReady();
         }
     }
 
     /// <summary>
-    /// 首批排序：失败多于成功的排后面，其余按扫描时的延迟升序。
-    /// 不直接按「失败次数」排 —— 那个计数器是累加的，一次历史失败会让一台好 DNS 永远靠后。
+    /// 首批排序：加权负面分高的排后面，其余按扫描时的延迟升序。
+    ///
+    /// 这里刻意区分了证据强度：投毒与 RST 是「答案本身有问题」的强证据，
+    /// 超时/不可达是弱证据（可能只是本机链路抖动），三者权重与半衰期都不同。
+    /// 全部按时间衰减，因此一次历史失败会随好表现被冲淡 —— 不会让一台 DNS 永久靠后。
     /// </summary>
-    /// <remarks>
-    /// 这里刻意给「答错」加了双倍权重。实测池内延迟最低的几台恰好是国内公共 DNS，
-    /// 它们对 github.com 的应答高度趋同（都返回同一个地址），一旦这个地址不可达，
-    /// 「按延迟排序」就会让首批永远押在同一个地址上 —— 单点赌注。
-    /// 把答错的台数按双倍计入降级判定，可以让首批逐渐换到「答得出且答得对」的台上去。
-    /// </remarks>
     private List<DnsPoolEntry> OrderByHealth(IReadOnlyList<DnsPoolEntry> pool)
     {
         if (pool.Count <= 1)
@@ -569,6 +584,7 @@ public sealed class ResolverHub
             return new List<DnsPoolEntry>(pool);
         }
 
+        var now = Environment.TickCount64;
         var scored = new List<(DnsPoolEntry Entry, int Index, int Degraded, int Latency)>(pool.Count);
 
         for (var i = 0; i < pool.Count; i++)
@@ -578,11 +594,16 @@ public sealed class ResolverHub
 
             if (_serverHealth.TryGetValue(entry.Ip, out var health))
             {
-                var ok = Volatile.Read(ref health.Ok);
-                var fail = Volatile.Read(ref health.Fail);
-                var bad = Volatile.Read(ref health.Bad);
+                double negative;
+                double positive;
 
-                degraded = (bad * 2) + fail > ok ? 1 : 0;
+                lock (health)
+                {
+                    negative = health.NegativeScore(now);
+                    positive = health.PositiveScore(now);
+                }
+
+                degraded = negative > positive + DegradeFloor ? 1 : 0;
             }
 
             scored.Add((entry, i, degraded, entry.LatencyMs));
@@ -612,25 +633,190 @@ public sealed class ResolverHub
         return ordered;
     }
 
-    private void RecordHealth(string ip, bool ok)
+    /// <summary>答出了可用地址：累加正向分，让历史失败随时间被冲淡。</summary>
+    private void RecordOk(string ip)
     {
         var health = _serverHealth.GetOrAdd(ip, _ => new ServerHealth());
+        var now = Environment.TickCount64;
 
-        if (ok)
+        lock (health)
         {
-            Interlocked.Increment(ref health.Ok);
-        }
-        else
-        {
-            Interlocked.Increment(ref health.Fail);
+            health.OkRaw++;
+            health.OkScore = Decay(health.OkScore, health.OkStamp, now, OkHalfLifeMs) + 1;
+            health.OkStamp = now;
         }
     }
 
-    private static int CountFound(List<IPAddress> found)
+    /// <summary>答不出（超时、传输失败、空答案）：弱证据，衰减最快的那个桶。</summary>
+    private void RecordFail(string ip)
     {
-        lock (found)
+        var health = _serverHealth.GetOrAdd(ip, _ => new ServerHealth());
+        var now = Environment.TickCount64;
+
+        lock (health)
         {
-            return found.Count;
+            health.FailRaw++;
+            health.FailScore = Decay(health.FailScore, health.FailStamp, now, SoftHalfLifeMs) + 1;
+            health.FailStamp = now;
+        }
+    }
+
+    /// <summary>答了，但答案全是不可路由地址：强证据（投毒/污染）。</summary>
+    private void RecordPoison(string ip)
+    {
+        var health = _serverHealth.GetOrAdd(ip, _ => new ServerHealth());
+        var now = Environment.TickCount64;
+
+        lock (health)
+        {
+            health.BadRaw++;
+            health.BadScore = Decay(health.BadScore, health.BadStamp, now, PoisonHalfLifeMs) + 1;
+            health.BadStamp = now;
+        }
+    }
+
+    /// <summary>
+    /// 一次扫描的显式上下文。把 host、池版本、候选表、首批发布状态绑在一起，
+    /// 而不是散落成闭包捕获的局部变量 —— 后者在「换池 / 发布 / 计时器同时触发」时
+    /// 很难说清哪份数据属于哪一轮扫描。
+    ///
+    /// 发布与缓存合并在<b>同一把锁</b>内完成：拆开的话，首批快照可能拍到
+    /// 「缓存已经写进去、候选表还没加进来」的中间态，调用方拿到的列表就少了一批地址。
+    /// </summary>
+    private sealed class SweepContext
+    {
+        private readonly object _gate = new();
+        private readonly List<IPAddress> _found = new(16);
+        private readonly HashSet<IPAddress> _seen = new();
+        private readonly TaskCompletionSource<IReadOnlyList<IPAddress>> _firstBatch =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private readonly ResolverHub _hub;
+        private readonly int _generation;
+
+        private bool _published;
+
+        public SweepContext(ResolverHub hub, string host, int generation, int minIps)
+        {
+            _hub = hub;
+            Host = host;
+            _generation = generation;
+            MinIps = Math.Max(1, minIps);
+        }
+
+        public string Host { get; }
+
+        public int MinIps { get; }
+
+        public Task<IReadOnlyList<IPAddress>> FirstBatch => _firstBatch.Task;
+
+        /// <summary>池在扫描途中被换掉：本轮结果一律丢弃，既不写缓存也不发布候选。</summary>
+        public bool IsStale => _generation != Volatile.Read(ref _hub._generation);
+
+        public int Count
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _found.Count;
+                }
+            }
+        }
+
+        /// <summary>收入一台 DNS 的答案。返回是否带来了新地址。</summary>
+        public bool Accept(string server, IReadOnlyList<IPAddress> addresses, int ttl)
+        {
+            lock (_gate)
+            {
+                if (IsStale)
+                {
+                    return false;
+                }
+
+                _hub._cache.Merge(Host, addresses, ttl, _hub._preferIpv4);
+
+                if (_hub._ipSource.Count >= IpSourceSoftLimit)
+                {
+                    _hub._ipSource.Clear();
+                }
+
+                var added = false;
+
+                foreach (var address in addresses)
+                {
+                    // 记录「谁给出了这个地址」，供后续竞速失败时归因。同一地址以首个给出者为准：
+                    // 后给出同一答案的 DNS 只是随声附和，不该分享责任。
+                    _hub._ipSource.TryAdd(address, server);
+
+                    if (_seen.Add(address))
+                    {
+                        _found.Add(address);
+                        added = true;
+                    }
+                }
+
+                if (added)
+                {
+                    _found.Sort(CompareAddress);
+                }
+
+                return added;
+            }
+        }
+
+        /// <summary>凑够 <see cref="MinIps"/> 就提前发布（由任一查询完成后调用）。</summary>
+        public void PublishIfReady()
+        {
+            lock (_gate)
+            {
+                if (_published || _found.Count < MinIps)
+                {
+                    return;
+                }
+
+                PublishLocked();
+            }
+        }
+
+        /// <summary>
+        /// 窗口到点：有多少发多少，<b>包括空列表</b>。
+        ///
+        /// 为什么允许发空：到点意味着「首批这几台在窗口内什么都没给出」，此时调用方
+        /// 更应该立刻回落系统 DNS，而不是继续等整轮扫描 —— 后台扫描仍会补齐缓存，
+        /// 下一次请求就能命中。反过来，若在还有查询在飞时硬等，首连预算会被整轮扫描吃光，
+        /// 用户看到的是「打不开」而不是「先从系统 DNS 走」。
+        /// </summary>
+        public void PublishOnWindow()
+        {
+            lock (_gate)
+            {
+                if (!_published)
+                {
+                    PublishLocked();
+                }
+            }
+        }
+
+        /// <summary>整轮结束：这是唯一允许发布空结果的出口。</summary>
+        public void PublishFinal()
+        {
+            lock (_gate)
+            {
+                if (_published)
+                {
+                    return;
+                }
+
+                PublishLocked();
+            }
+        }
+
+        /// <summary>调用方必须已持有 <see cref="_gate"/>。</summary>
+        private void PublishLocked()
+        {
+            _published = true;
+            _firstBatch.TrySetResult(_found.ToArray());
         }
     }
 

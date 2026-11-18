@@ -129,8 +129,8 @@ public sealed class PoisonFilterTests : IDisposable
 
         var before = hub.GetServerHealth("10.0.0.2");
 
-        // 模拟竞速判定这个地址连不上
-        hub.ReportBadAnswer(result[0]);
+        // 模拟竞速判定这个地址连不上：上游回了 RST（强证据）
+        hub.ReportBadAnswer(result[0], AddressFailureKind.Refused);
 
         var after = hub.GetServerHealth("10.0.0.2");
 
@@ -139,13 +139,35 @@ public sealed class PoisonFilterTests : IDisposable
     }
 
     [Fact]
+    public async Task Timeout_is_weaker_evidence_than_refused()
+    {
+        var settings = BuildSettings("10.0.0.2");
+
+        DnsQueryHandler handler = (server, host, timeout, token, ipv6) => Task.FromResult<DnsQueryResult?>(
+            ipv6 ? null : new DnsQueryResult(new[] { IPAddress.Parse("20.205.243.166") }, 60));
+
+        var hub = new ResolverHub(settings, _log, handler);
+        var result = await hub.ResolveAsync("github.com", CancellationToken.None);
+
+        Assert.Single(result);
+
+        // 同一条 DNS，同样的失败次数，只是失败类型不同：超时不该像 RST 那样重罚。
+        // 这是「网络抖动不该把好 DNS 判死」的具体落地：区分强弱证据，而不是一律累加。
+        hub.ReportBadAnswer(result[0], AddressFailureKind.Timeout);
+
+        var (ok, fail) = hub.GetServerHealth("10.0.0.2");
+        Assert.True(fail > 0, "超时也要被记录，只是权重更低");
+        Assert.True(ok > 0, "答对过的事实不能被抹掉");
+    }
+
+    [Fact]
     public void Unknown_address_does_not_throw()
     {
         var hub = new ResolverHub(BuildSettings("10.0.0.1"), _log);
 
         // 没有来源记录的地址（例如缓存恢复的）不应引发异常
-        hub.ReportBadAnswer(IPAddress.Parse("20.205.243.166"));
-        hub.ReportBadAnswer(null);
+        hub.ReportBadAnswer(IPAddress.Parse("20.205.243.166"), AddressFailureKind.Refused);
+        hub.ReportBadAnswer(null, AddressFailureKind.Timeout);
 
         Assert.Equal((0, 0), hub.GetServerHealth("10.0.0.1"));
     }

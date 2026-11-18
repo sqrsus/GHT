@@ -10,6 +10,25 @@ namespace GHT.Services;
 public readonly record struct RaceWin(IPAddress Ip, TcpClient Client);
 
 /// <summary>
+/// 建连失败的类型。分类的意义在于<b>证据强度</b>不同，回灌给 DNS 健康度时权重也不同：
+/// <list type="bullet">
+/// <item><see cref="Refused"/>：对方回了 RST —— 地址是活的，只是不为这个域名服务。
+///       这是「答案本身有问题」的强证据（投毒、过时记录、错误的边缘节点）。</item>
+/// <item><see cref="Timeout"/>：连 SYN 都没回应 —— 可能是地址不可达，也可能是本机链路抖动，
+///       弱证据，不能据此把一台好 DNS 判死。</item>
+/// <item><see cref="Unreachable"/>：明确的路由不可达（无路由、地址族不支持），
+///       多半是本机网络环境问题，同样按弱证据处理。</item>
+/// </list>
+/// </summary>
+public enum AddressFailureKind
+{
+    Refused,
+    Timeout,
+    Unreachable,
+    Other
+}
+
+/// <summary>
 /// TCP 建连竞速：同时向多个候选 IP 发起 connect，第一个成功的即为上游。
 /// 只做握手竞速，不读不写任何业务数据，因此对 TLS 完全透明。
 ///
@@ -73,7 +92,7 @@ public sealed class UpstreamRacer
         int connectTimeoutMs,
         int batchBudgetMs,
         CancellationToken cancellationToken,
-        Action<IPAddress, long>? onFailure = null)
+        Action<IPAddress, long, AddressFailureKind>? onFailure = null)
     {
         if (candidates.Count == 0)
         {
@@ -82,27 +101,21 @@ public sealed class UpstreamRacer
 
         var ordered = OrderByHealth(candidates);
 
-        var limits = new List<int>(2);
-        if (connectTimeoutMs > 0)
-        {
-            limits.Add(connectTimeoutMs);
-        }
+        using var scope = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
+        // 批级预算只由 <paramref name="batchBudgetMs"/> 决定。
+        // 旧实现取 min(单地址超时, 批预算) 作为整批的取消时间，于是「单地址超时」和「批预算到期」
+        // 共用一个令牌，永远分不清两者 —— 而这正是「失败明细里看不出是地址坏还是预算小」的根源。
+        // 单地址超时现在由每次尝试自己的令牌负责（见 TryConnectAsync）。
         if (batchBudgetMs > 0)
         {
-            limits.Add(batchBudgetMs);
-        }
-
-        using var scope = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        if (limits.Count > 0)
-        {
-            scope.CancelAfter(limits.Min());
+            scope.CancelAfter(batchBudgetMs);
         }
 
         var pending = new List<Task<RaceWin?>>(ordered.Count);
         foreach (var candidate in ordered)
         {
-            pending.Add(TryConnectAsync(candidate, port, scope.Token, onFailure));
+            pending.Add(TryConnectAsync(candidate, port, connectTimeoutMs, scope.Token, onFailure));
         }
 
         while (pending.Count > 0)
@@ -219,14 +232,23 @@ public sealed class UpstreamRacer
     private async Task<RaceWin?> TryConnectAsync(
         IPAddress address,
         int port,
+        int connectTimeoutMs,
         CancellationToken token,
-        Action<IPAddress, long>? onFailure = null)
+        Action<IPAddress, long, AddressFailureKind>? onFailure = null)
     {
         var stopwatch = Stopwatch.StartNew();
 
+        // 单地址超时用<b>独立</b>的令牌：否则「这个地址超时了」和「整批预算到期了」
+        // 都表现为同一个 token 被取消，无法区分 —— 前者是地址的问题，后者是我们自己的决定。
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(token);
+        if (connectTimeoutMs > 0)
+        {
+            attempt.CancelAfter(connectTimeoutMs);
+        }
+
         try
         {
-            var client = await _connect(address, port, token).ConfigureAwait(false);
+            var client = await _connect(address, port, attempt.Token).ConfigureAwait(false);
             stopwatch.Stop();
 
             RecordSuccess(address, stopwatch.Elapsed.TotalMilliseconds);
@@ -240,14 +262,44 @@ public sealed class UpstreamRacer
             stopwatch.Stop();
             return null;
         }
+        catch (OperationCanceledException)
+        {
+            // 只有本地址的超时令牌被触发：地址在期限内没连上，属弱证据
+            stopwatch.Stop();
+            RecordFailure(address);
+            onFailure?.Invoke(address, (long)stopwatch.ElapsedMilliseconds, AddressFailureKind.Timeout);
+            return null;
+        }
+        catch (SocketException ex)
+        {
+            stopwatch.Stop();
+            RecordFailure(address);
+            onFailure?.Invoke(address, (long)stopwatch.ElapsedMilliseconds, Classify(ex.SocketErrorCode));
+            return null;
+        }
         catch
         {
             stopwatch.Stop();
             RecordFailure(address);
-            onFailure?.Invoke(address, (long)stopwatch.ElapsedMilliseconds);
+            onFailure?.Invoke(address, (long)stopwatch.ElapsedMilliseconds, AddressFailureKind.Other);
             return null;
         }
     }
+
+    /// <summary>把套接字错误映射成证据强度。未列出的错误一律按「其它」= 弱证据处理。</summary>
+    internal static AddressFailureKind Classify(SocketError error) => error switch
+    {
+        SocketError.ConnectionRefused or SocketError.ConnectionReset => AddressFailureKind.Refused,
+
+        SocketError.TimedOut => AddressFailureKind.Timeout,
+
+        SocketError.HostUnreachable or SocketError.NetworkUnreachable or SocketError.HostDown
+            or SocketError.NetworkDown or SocketError.HostNotFound or SocketError.NoData
+            or SocketError.AddressNotAvailable or SocketError.AddressFamilyNotSupported
+            or SocketError.TryAgain => AddressFailureKind.Unreachable,
+
+        _ => AddressFailureKind.Other
+    };
 
     private void RecordSuccess(IPAddress address, double milliseconds)
     {

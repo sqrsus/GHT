@@ -70,7 +70,7 @@ public sealed class UpstreamHealthTests : IDisposable
     public async Task Real_failure_reports_address_and_elapsed_time()
     {
         var racer = new UpstreamRacer(_log, Refused(delayMs: 100));
-        var reported = new List<(IPAddress Ip, long Ms)>();
+        var reported = new List<(IPAddress Ip, long Ms, AddressFailureKind Kind)>();
 
         var win = await racer.RaceAsync(
             new[] { IPAddress.Parse(Sample) },
@@ -78,21 +78,43 @@ public sealed class UpstreamHealthTests : IDisposable
             5000,
             5000,
             CancellationToken.None,
-            (ip, ms) => reported.Add((ip, ms)));
+            (ip, ms, kind) => reported.Add((ip, ms, kind)));
 
         Assert.Null(win);
         Assert.Single(reported);
         Assert.Equal(IPAddress.Parse(Sample), reported[0].Ip);
+        Assert.Equal(AddressFailureKind.Refused, reported[0].Kind);
 
         // 只断下界：卡了 100ms 就一定不会报出更小的值，负载再高也只会更大
         Assert.True(reported[0].Ms >= 50, $"耗时必须反映真实等待（实测 {reported[0].Ms}ms），用于区分「快拒绝」与「超时」");
     }
 
     [Fact]
+    public async Task Per_address_timeout_is_reported_as_timeout_not_as_budget_cancel()
+    {
+        var racer = new UpstreamRacer(_log, Hanging());
+        var reported = new List<(IPAddress Ip, long Ms, AddressFailureKind Kind)>();
+
+        // 单地址超时 150ms，批预算 5000ms：先到的一定是单地址超时。
+        // 这两个原本共用一个取消令牌，于是超时会被误判成「预算到期」而不留任何痕迹。
+        var win = await racer.RaceAsync(
+            new[] { IPAddress.Parse(Sample) },
+            1,
+            connectTimeoutMs: 150,
+            batchBudgetMs: 5000,
+            CancellationToken.None,
+            (ip, ms, kind) => reported.Add((ip, ms, kind)));
+
+        Assert.Null(win);
+        Assert.Single(reported);
+        Assert.Equal(AddressFailureKind.Timeout, reported[0].Kind);
+    }
+
+    [Fact]
     public async Task Budget_cancellation_is_not_recorded_as_address_failure()
     {
         var racer = new UpstreamRacer(_log, Hanging());
-        var reported = new List<(IPAddress Ip, long Ms)>();
+        var reported = new List<(IPAddress Ip, long Ms, AddressFailureKind Kind)>();
 
         var win = await racer.RaceAsync(
             new[] { IPAddress.Parse(Sample) },
@@ -100,7 +122,7 @@ public sealed class UpstreamHealthTests : IDisposable
             connectTimeoutMs: 5000,
             batchBudgetMs: 150,
             CancellationToken.None,
-            (ip, ms) => reported.Add((ip, ms)));
+            (ip, ms, kind) => reported.Add((ip, ms, kind)));
 
         Assert.Null(win);
         Assert.Empty(reported);

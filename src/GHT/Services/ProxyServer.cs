@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
@@ -64,11 +65,79 @@ public sealed class ProxyServer : IAsyncDisposable
     private const int MaxTrailerBytes = 8 * 1024;
     private const int MaxChunkLineLength = 8 * 1024;
 
+    /// <summary>
+    /// 停止时等待活跃连接自行退出的上限。超过就强关，因为客户端可能正处在
+    /// 「不发也不收」的状态（浏览器标签页挂起、IDE 的长连接），等它自己结束是不现实的。
+    /// </summary>
+    private const int StopDrainMs = 3000;
+
+    /// <summary>强关之后给处理循环收尾的时间，用于把统计与日志写完。</summary>
+    private const int ForceCloseGraceMs = 500;
+
     private enum LifecycleState
     {
         Stopped,
         Running,
         Stopping
+    }
+
+    /// <summary>
+    /// 一条客户端连接的跟踪记录。
+    ///
+    /// 为什么需要它：旧实现的 <c>AcceptLoop</c> 用 <c>_ = Task.Run(...)</c> 把任务直接丢掉，
+    /// 于是 <see cref="StopAsync"/> 只能等接入循环，等不到<b>已接入</b>的连接 ——
+    /// 停止后隧道仍在跑、统计仍在涨，进程退出时健康度与日志也可能来不及落盘。
+    ///
+    /// 上游连接也要登记：客户端 socket 被关掉时，正向泵会抛异常退出，但反向泵可能还卡在
+    /// 上游的 ReadAsync 上；只关客户端会留下一个悬挂的上游 socket。
+    /// </summary>
+    private sealed class ConnectionState
+    {
+        private TcpClient? _upstream;
+        private Task _task = Task.CompletedTask;
+
+        public ConnectionState(TcpClient client) => Client = client;
+
+        public TcpClient Client { get; }
+
+        /// <summary>处理任务。由接入循环在 <c>Task.Run</c> 之后立刻写入。</summary>
+        public Task Task
+        {
+            get => Volatile.Read(ref _task);
+            set => Volatile.Write(ref _task, value);
+        }
+
+        public void AttachUpstream(TcpClient upstream) => Volatile.Write(ref _upstream, upstream);
+
+        public bool IsCompleted => Task.IsCompleted;
+
+        /// <summary>强制关闭两端。可在任意线程调用，重复调用无害。</summary>
+        public void Abort()
+        {
+            try
+            {
+                Client.Dispose();
+            }
+            catch
+            {
+                // 已经关了
+            }
+
+            var upstream = Volatile.Read(ref _upstream);
+            if (upstream is null)
+            {
+                return;
+            }
+
+            try
+            {
+                upstream.Dispose();
+            }
+            catch
+            {
+                // 已经关了
+            }
+        }
     }
 
     private readonly LogService _log;
@@ -77,6 +146,11 @@ public sealed class ProxyServer : IAsyncDisposable
     private readonly ProxyStatistics _statistics = new();
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
 
+    /// <summary>活跃连接表。只在接入时增加、处理结束时移除，停止时用于有界收尾。</summary>
+    private readonly ConcurrentDictionary<long, ConnectionState> _connections = new();
+
+    private long _connectionSeq;
+
     private volatile AppSettings _settings;
     private volatile DomainWildcardList _whitelist;
     private volatile LifecycleState _state = LifecycleState.Stopped;
@@ -84,17 +158,25 @@ public sealed class ProxyServer : IAsyncDisposable
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
     private Task? _acceptLoop;
+    private readonly string? _healthPath;
     private int _port;
 
     public ProxyServer(AppSettings settings, LogService log)
+        : this(settings, log, healthPath: null)
+    {
+    }
+
+    /// <summary>测试构造：把健康度文件重定向到临时目录，避免污染真实的 %LOCALAPPDATA%\GHT。</summary>
+    internal ProxyServer(AppSettings settings, LogService log, string? healthPath)
     {
         _settings = settings;
         _log = log;
+        _healthPath = healthPath;
         _resolver = new ResolverHub(settings, log);
         _racer = new UpstreamRacer(log);
 
         // 健康度落盘后，重启不必再用首连预算去重新试错「哪些地址连不上」。
-        _racer.Load();
+        _racer.Load(healthPath);
 
         _whitelist = DomainWildcardList.Parse(settings.GlobalDnsWhitelist);
     }
@@ -226,11 +308,15 @@ public sealed class ProxyServer : IAsyncDisposable
                 }
             }
 
+            // 接入循环只覆盖「还没交出去的连接」。已接入的长连接必须在这里有界收尾，
+            // 否则停止返回后隧道仍在转发、统计仍在变化，退出时的落盘也可能被抢在后面。
+            await DrainConnectionsAsync().ConfigureAwait(false);
+
             cts?.Dispose();
 
             // 停止时把地址健康度落盘：这是唯一能确保「下次启动不用重新试错」的时机。
             // 放在这里而不是 Dispose，是因为用户可以反复启停，每次停止都是一个新的学习终点。
-            _racer.Save();
+            _racer.Save(_healthPath);
 
             _state = LifecycleState.Stopped;
             _log.Info("代理已停止");
@@ -242,6 +328,49 @@ public sealed class ProxyServer : IAsyncDisposable
     }
 
     public async ValueTask DisposeAsync() => await StopAsync().ConfigureAwait(false);
+
+    /// <summary>当前仍在处理的连接数（诊断与测试用）。</summary>
+    public int ActiveConnections => _connections.Count;
+
+    /// <summary>
+    /// 让活跃连接在 <see cref="StopDrainMs"/> 内自行退出，超时则强制关闭两端并再给一点收尾时间。
+    ///
+    /// 顺序是刻意的：先礼后兵。正常退出能保证统计、半关闭与日志都走完整路径；
+    /// 强制关闭只是兜底，被强关的连接会以异常路径结束，统计里的错误计数会多一条 ——
+    /// 这是可接受的代价，比「停止返回了但连接还活着」要好。
+    /// </summary>
+    private async Task DrainConnectionsAsync()
+    {
+        var snapshot = _connections.Values.ToArray();
+        if (snapshot.Length == 0)
+        {
+            return;
+        }
+
+        var tasks = snapshot.Select(state => state.Task).Where(task => !task.IsCompleted).ToArray();
+        if (tasks.Length == 0)
+        {
+            _connections.Clear();
+            return;
+        }
+
+        var all = Task.WhenAll(tasks);
+
+        if (await Task.WhenAny(all, Task.Delay(StopDrainMs)).ConfigureAwait(false) != all)
+        {
+            var remaining = snapshot.Count(state => !state.IsCompleted);
+            _log.Warn($"停止时仍有 {remaining} 条连接未退出，强制关闭");
+
+            foreach (var state in snapshot)
+            {
+                state.Abort();
+            }
+
+            await Task.WhenAny(all, Task.Delay(ForceCloseGraceMs)).ConfigureAwait(false);
+        }
+
+        _connections.Clear();
+    }
 
     // ── 接入 ────────────────────────────────────────────────────────────
 
@@ -278,12 +407,31 @@ public sealed class ProxyServer : IAsyncDisposable
                 continue;
             }
 
-            _ = Task.Run(() => HandleClientAsync(client, token), CancellationToken.None);
+            var state = new ConnectionState(client);
+            var id = Interlocked.Increment(ref _connectionSeq);
+
+            // 先登记再启动：反过来的话，停止流程可能刚好在「已启动、未登记」的窗口里扫过连接表。
+            _connections[id] = state;
+            state.Task = Task.Run(() => RunConnectionAsync(id, state, token), CancellationToken.None);
         }
     }
 
-    private async Task HandleClientAsync(TcpClient client, CancellationToken token)
+    private async Task RunConnectionAsync(long id, ConnectionState state, CancellationToken token)
     {
+        try
+        {
+            await HandleClientAsync(state, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            _connections.TryRemove(id, out _);
+        }
+    }
+
+    private async Task HandleClientAsync(ConnectionState state, CancellationToken token)
+    {
+        var client = state.Client;
+
         _statistics.AddRequest();
 
         try
@@ -327,11 +475,11 @@ public sealed class ProxyServer : IAsyncDisposable
 
                 if (string.Equals(head.Method, "CONNECT", StringComparison.OrdinalIgnoreCase))
                 {
-                    await HandleConnectAsync(client, stream, body, head, token).ConfigureAwait(false);
+                    await HandleConnectAsync(state, stream, body, head, token).ConfigureAwait(false);
                 }
                 else
                 {
-                    await HandlePlainAsync(stream, body, head, token).ConfigureAwait(false);
+                    await HandlePlainAsync(state, stream, body, head, token).ConfigureAwait(false);
                 }
             }
         }
@@ -358,7 +506,7 @@ public sealed class ProxyServer : IAsyncDisposable
     // ── CONNECT 隧道 ────────────────────────────────────────────────────
 
     private async Task HandleConnectAsync(
-        TcpClient client,
+        ConnectionState state,
         Stream clientStream,
         Stream clientInput,
         HttpHead head,
@@ -398,6 +546,9 @@ public sealed class ProxyServer : IAsyncDisposable
 
         using (upstream)
         {
+            // 登记上游：停止时如果这个方向卡在上游 ReadAsync 上，只关客户端是收不掉的。
+            state.AttachUpstream(upstream);
+
             TuneSocket(upstream.Client);
 
             await clientStream.WriteAsync(ProxyProtocol.ConnectEstablished, token).ConfigureAwait(false);
@@ -409,7 +560,7 @@ public sealed class ProxyServer : IAsyncDisposable
 
             try
             {
-                await RelayAsync(client, clientStream, upstream, upstreamStream, token).ConfigureAwait(false);
+                await RelayAsync(state.Client, clientStream, upstream, upstreamStream, token).ConfigureAwait(false);
             }
             finally
             {
@@ -421,7 +572,12 @@ public sealed class ProxyServer : IAsyncDisposable
 
     // ── 明文 HTTP ───────────────────────────────────────────────────────
 
-    private async Task HandlePlainAsync(Stream clientStream, Stream clientInput, HttpHead head, CancellationToken token)
+    private async Task HandlePlainAsync(
+        ConnectionState state,
+        Stream clientStream,
+        Stream clientInput,
+        HttpHead head,
+        CancellationToken token)
     {
         if (!head.Target.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
         {
@@ -463,6 +619,7 @@ public sealed class ProxyServer : IAsyncDisposable
 
         using (upstream)
         {
+            state.AttachUpstream(upstream);
             TuneSocket(upstream.Client);
 
             var upstreamStream = upstream.GetStream();
@@ -643,18 +800,19 @@ public sealed class ProxyServer : IAsyncDisposable
 
         // 失败的候选明细。原来的实现只打一句「预算用尽」，既不知道试了哪些地址，
         // 也不知道每个卡了多久 —— 而这两个数字正是区分「地址坏」「链路坏」「预算小」的关键。
-        var failures = new List<(IPAddress Ip, long ElapsedMs)>(candidates.Count);
+        var failures = new List<(IPAddress Ip, long ElapsedMs, AddressFailureKind Kind)>(candidates.Count);
 
-        void OnFailure(IPAddress address, long elapsedMs)
+        void OnFailure(IPAddress address, long elapsedMs, AddressFailureKind kind)
         {
             lock (failures)
             {
-                failures.Add((address, elapsedMs));
+                failures.Add((address, elapsedMs, kind));
             }
 
             // 回灌：这个地址连不上，责任在于「给出这个答案的那台 DNS」。
-            // 只影响后续首批的排序，不会把任何 DNS 从池里剔除。
-            _resolver.ReportBadAnswer(address);
+            // 只影响后续首批的排序，不会把任何 DNS 从池里剔除；权重由失败类型决定，
+            // RST 是强证据、超时是弱证据，避免一次链路抖动把好 DNS 永久降权。
+            _resolver.ReportBadAnswer(address, kind);
         }
 
         for (var round = 0; round <= rounds; round++)
@@ -740,7 +898,7 @@ public sealed class ProxyServer : IAsyncDisposable
         string host,
         int port,
         int candidateCount,
-        List<(IPAddress Ip, long ElapsedMs)> failures,
+        List<(IPAddress Ip, long ElapsedMs, AddressFailureKind Kind)> failures,
         string reason)
     {
         lock (failures)
@@ -752,7 +910,7 @@ public sealed class ProxyServer : IAsyncDisposable
             }
 
             var ordered = failures.OrderByDescending(f => f.ElapsedMs).ToList();
-            var preview = string.Join(", ", ordered.Take(6).Select(f => $"{f.Ip}({f.ElapsedMs}ms)"));
+            var preview = string.Join(", ", ordered.Take(6).Select(f => $"{f.Ip}({f.Kind},{f.ElapsedMs}ms)"));
 
             _log.Debug(
                 $"{host}:{port} {reason}：候选 {candidateCount} 个，{ordered.Count} 个失败，"

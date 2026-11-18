@@ -19,6 +19,23 @@ public partial class App : Application
 
         Log = new LogService(AppPaths.LogDirectory);
         Log.Info($"GHT 启动，版本 {typeof(App).Assembly.GetName().Version}");
+        Log.Info($"运行环境：{RuntimeGuard.Describe()}");
+
+        // 环境不满足时，任何后续逻辑都可能崩在别处，且症状与真正原因无关。
+        // 在创建任何窗口之前说清楚，是唯一能让用户看懂的时刻。
+        if (!RuntimeGuard.IsSupported(out var reason))
+        {
+            Log.Warn($"不支持的运行环境：{reason}");
+
+            MessageBox.Show(
+                $"{reason}。\n\n当前环境：\n{RuntimeGuard.Describe()}",
+                "GHT 无法在此系统上运行",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+
+            Shutdown(1);
+            return;
+        }
 
         _singleInstance = new SingleInstance();
 
