@@ -23,7 +23,7 @@ public sealed class SettingsTests
     {
         var settings = new AppSettings { ConnectBudgetMs = -1 };
         SettingsStore.Normalize(settings);
-        Assert.Equal(1500, settings.ConnectBudgetMs);
+        Assert.Equal(3000, settings.ConnectBudgetMs);
     }
 
     [Fact]

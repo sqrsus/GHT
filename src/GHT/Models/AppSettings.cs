@@ -30,7 +30,13 @@ public sealed class AppSettings
     /// 首连预算（毫秒）。超时即先回落系统 DNS，DNS 扫描在后台继续。
     /// 设为 0 表示不限预算（等价于改造前「等扫描完成」的行为，作为回滚开关）。
     /// </summary>
-    public int ConnectBudgetMs { get; set; } = 1500;
+    /// <remarks>
+    /// 默认值从 1500 提到 3000 是有实测依据的：不可达的上游地址（SYN 无响应）
+    /// 建连失败要 3000ms 左右才返回，1500ms 会在「还没试出结论」时就掐断竞速，
+    /// 日志表现为「首连预算用尽」，而真实原因可能是候选里混了坏地址。
+    /// 预算略大于失败耗时，才能让竞速给出确定结论而不是被截断。
+    /// </remarks>
+    public int ConnectBudgetMs { get; set; } = 3000;
 
     /// <summary>
     /// 加速池候选全部建连失败后，是否再用系统 DNS 兜底（默认开）。
@@ -46,8 +52,12 @@ public sealed class AppSettings
     /// <summary>单个 IP 的 TCP 建连超时。</summary>
     public int RaceConnectTimeoutMs { get; set; } = 5000;
 
-    /// <summary>单批竞速的总时长上限。</summary>
-    public int RaceBatchBudgetMs { get; set; } = 6000;
+    /// <summary>
+    /// 单批竞速的总时长上限。
+    /// 应当小于 <see cref="ConnectBudgetMs"/>：批预算比总预算还大时，它永远不会生效，
+    /// 等于只有一个隐形的总预算在起作用，调它没有任何意义。
+    /// </summary>
+    public int RaceBatchBudgetMs { get; set; } = 3000;
 
     /// <summary>整批候选都失败后的重赛轮数。</summary>
     public int RaceRetryRounds { get; set; } = 2;
@@ -68,8 +78,15 @@ public sealed class AppSettings
     /// <summary>解析结果缓存的最大 TTL（秒）。</summary>
     public int DnsCacheMaxTtlSec { get; set; } = 600;
 
-    /// <summary>首批结果聚合窗口；0 表示不聚合，拿到第一批立刻返回。</summary>
-    public int FirstBatchCollectMs { get; set; } = 200;
+    /// <summary>
+    /// 首批结果聚合窗口；0 表示不聚合，拿到第一批立刻返回。
+    /// </summary>
+    /// <remarks>
+    /// 默认值从 200 提到 600：200ms 时通常只有国内公共 DNS 来得及答复，
+    /// 而它们对同一域名的答案高度趋同，去重后往往只剩一个候选 —— 竞速退化成单点赌注。
+    /// 600ms 能让境外 DNS（实测 45~100ms）也进入首批，候选从 1 个变成多个。
+    /// </remarks>
+    public int FirstBatchCollectMs { get; set; } = 600;
 
     /// <summary>首批至少凑够多少个 IP 就提前返回。</summary>
     public int FirstBatchMinIps { get; set; } = 5;

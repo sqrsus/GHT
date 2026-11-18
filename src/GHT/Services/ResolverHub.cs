@@ -52,6 +52,19 @@ public sealed class ResolverHub
     private readonly ConcurrentDictionary<string, ServerHealth> _serverHealth =
         new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// 候选 IP → 首个给出它的那台 DNS。
+    ///
+    /// 为什么需要这张表：健康度原本只区分「能答 / 不能答」，但真正有害的是<b>能答却答错</b> ——
+    /// 实测池里有 DNS 对 github.com 返回 127.0.0.1、198.51.44.8 这类地址，它们「答得很积极」，
+    /// 于是永远排在首批，而答案永远连不上。有了 IP 到来源的映射，竞速失败时才能把责任
+    /// 精确记到那台 DNS 上，而不是笼统地让所有 DNS 一起背锅。
+    /// </summary>
+    private readonly ConcurrentDictionary<IPAddress, string> _ipSource = new();
+
+    /// <summary>映射表的软上限。地址集合本身有限，这里只是防止长期运行后无限增长。</summary>
+    private const int IpSourceSoftLimit = 8192;
+
     private volatile IReadOnlyList<DnsPoolEntry> _pool = Array.Empty<DnsPoolEntry>();
 
     /// <summary>加速池版本号。每次换池自增，用来丢弃「换池前发起、换池后才完成」的扫描结果。</summary>
@@ -88,6 +101,7 @@ public sealed class ResolverHub
     public int CachedDomainCount => _cache.Count;
 
     /// <summary>取某台公共 DNS 的成功/失败次数（从未参与解析时返回 (0,0)）。</summary>
+    /// <remarks>「答了但答案连不上」也计入失败，因为对使用者而言它与解析失败没有区别。</remarks>
     public (int Ok, int Fail) GetServerHealth(string ip)
     {
         if (string.IsNullOrEmpty(ip) || !_serverHealth.TryGetValue(ip, out var health))
@@ -95,13 +109,41 @@ public sealed class ResolverHub
             return (0, 0);
         }
 
-        return (Volatile.Read(ref health.Ok), Volatile.Read(ref health.Fail));
+        return (
+            Volatile.Read(ref health.Ok),
+            Volatile.Read(ref health.Fail) + Volatile.Read(ref health.Bad));
+    }
+
+    /// <summary>
+    /// 竞速判定某个候选地址连不上时回灌：把责任记到「给出这个答案的那台 DNS」上。
+    ///
+    /// 只影响排序，不影响可用性 —— 被记过的 DNS 仍会参与解析，只是排到后面。
+    /// 这是刻意的：池里如果全是劣质 DNS，直接剔除会让人彻底连不上，降权则只是「先用好的」。
+    /// </summary>
+    public void ReportBadAnswer(IPAddress? address)
+    {
+        if (address is null)
+        {
+            return;
+        }
+
+        if (!_ipSource.TryGetValue(address, out var server) || string.IsNullOrEmpty(server))
+        {
+            return;
+        }
+
+        var health = _serverHealth.GetOrAdd(server, _ => new ServerHealth());
+        Interlocked.Increment(ref health.Bad);
     }
 
     private sealed class ServerHealth
     {
         public int Ok;
         public int Fail;
+
+        /// <summary>「答了，但答案连不上」的次数。与 Fail 分开计，因为两者含义不同：</summary>
+        /// <remarks>Fail 是答不出（网络不通/超时），Bad 是答了但答错（投毒、污染、过时记录）。</remarks>
+        public int Bad;
     }
 
     public void ApplySettings(AppSettings settings)
@@ -419,7 +461,8 @@ public sealed class ResolverHub
 
         var addresses = new List<IPAddress>(8);
         var ttl = _maxTtl;
-        var hit = false;
+        var answered = false;
+        var rejected = 0;
 
         foreach (var answer in answers)
         {
@@ -434,22 +477,55 @@ public sealed class ResolverHub
                 continue;
             }
 
-            hit = true;
-            addresses.AddRange(result.Addresses);
+            answered = true;
 
             // 一次合并内的 TTL 取最小值：宁可早一点重新解析，也不要把快过期的地址留太久
             ttl = Math.Min(ttl, Math.Clamp(result.TtlSeconds, _minTtl, _maxTtl));
+
+            foreach (var address in result.Addresses)
+            {
+                // 投毒/污染的应答必须在入池前丢掉，而不是留到竞速阶段靠失败来淘汰：
+                // 它们「失败得很快」反而会占满一批竞速名额，并让 1500ms 的首连预算
+                // 全部消耗在必然失败的地址上。
+                if (!AddressPolicy.IsRoutable(address))
+                {
+                    rejected++;
+                    continue;
+                }
+
+                addresses.Add(address);
+            }
         }
 
-        if (!hit)
+        if (addresses.Count == 0)
         {
+            // 「答了但全被过滤」比「没答」更该降权：这说明该 DNS 正在返回不可路由的地址，
+            // 下次不该再让它进首批。
             RecordHealth(entry.Ip, false);
+
+            if (answered && rejected > 0)
+            {
+                _log.Debug($"{entry.Ip} 对 {host} 的应答全部不可路由（{rejected} 个），已丢弃");
+            }
+
             return;
         }
 
         RecordHealth(entry.Ip, true);
 
         _cache.Merge(host, addresses, ttl, _preferIpv4);
+
+        // 记录「谁给出了这个地址」，供后续竞速失败时归因。同一地址以首个给出者为准：
+        // 后给出同一答案的 DNS 只是随声附和，不该分享责任。
+        if (_ipSource.Count >= IpSourceSoftLimit)
+        {
+            _ipSource.Clear();
+        }
+
+        foreach (var address in addresses)
+        {
+            _ipSource.TryAdd(address, entry.Ip);
+        }
 
         var added = false;
 
@@ -480,6 +556,12 @@ public sealed class ResolverHub
     /// 首批排序：失败多于成功的排后面，其余按扫描时的延迟升序。
     /// 不直接按「失败次数」排 —— 那个计数器是累加的，一次历史失败会让一台好 DNS 永远靠后。
     /// </summary>
+    /// <remarks>
+    /// 这里刻意给「答错」加了双倍权重。实测池内延迟最低的几台恰好是国内公共 DNS，
+    /// 它们对 github.com 的应答高度趋同（都返回同一个地址），一旦这个地址不可达，
+    /// 「按延迟排序」就会让首批永远押在同一个地址上 —— 单点赌注。
+    /// 把答错的台数按双倍计入降级判定，可以让首批逐渐换到「答得出且答得对」的台上去。
+    /// </remarks>
     private List<DnsPoolEntry> OrderByHealth(IReadOnlyList<DnsPoolEntry> pool)
     {
         if (pool.Count <= 1)
@@ -496,7 +578,11 @@ public sealed class ResolverHub
 
             if (_serverHealth.TryGetValue(entry.Ip, out var health))
             {
-                degraded = Volatile.Read(ref health.Fail) > Volatile.Read(ref health.Ok) ? 1 : 0;
+                var ok = Volatile.Read(ref health.Ok);
+                var fail = Volatile.Read(ref health.Fail);
+                var bad = Volatile.Read(ref health.Bad);
+
+                degraded = (bad * 2) + fail > ok ? 1 : 0;
             }
 
             scored.Add((entry, i, degraded, entry.LatencyMs));

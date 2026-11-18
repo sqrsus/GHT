@@ -92,6 +92,10 @@ public sealed class ProxyServer : IAsyncDisposable
         _log = log;
         _resolver = new ResolverHub(settings, log);
         _racer = new UpstreamRacer(log);
+
+        // 健康度落盘后，重启不必再用首连预算去重新试错「哪些地址连不上」。
+        _racer.Load();
+
         _whitelist = DomainWildcardList.Parse(settings.GlobalDnsWhitelist);
     }
 
@@ -223,6 +227,11 @@ public sealed class ProxyServer : IAsyncDisposable
             }
 
             cts?.Dispose();
+
+            // 停止时把地址健康度落盘：这是唯一能确保「下次启动不用重新试错」的时机。
+            // 放在这里而不是 Dispose，是因为用户可以反复启停，每次停止都是一个新的学习终点。
+            _racer.Save();
+
             _state = LifecycleState.Stopped;
             _log.Info("代理已停止");
         }
@@ -632,6 +641,22 @@ public sealed class ProxyServer : IAsyncDisposable
         var rounds = Math.Clamp(settings.RaceRetryRounds, 0, 5);
         var maxIps = Math.Clamp(settings.RaceMaxIps, 1, 64);
 
+        // 失败的候选明细。原来的实现只打一句「预算用尽」，既不知道试了哪些地址，
+        // 也不知道每个卡了多久 —— 而这两个数字正是区分「地址坏」「链路坏」「预算小」的关键。
+        var failures = new List<(IPAddress Ip, long ElapsedMs)>(candidates.Count);
+
+        void OnFailure(IPAddress address, long elapsedMs)
+        {
+            lock (failures)
+            {
+                failures.Add((address, elapsedMs));
+            }
+
+            // 回灌：这个地址连不上，责任在于「给出这个答案的那台 DNS」。
+            // 只影响后续首批的排序，不会把任何 DNS 从池里剔除。
+            _resolver.ReportBadAnswer(address);
+        }
+
         for (var round = 0; round <= rounds; round++)
         {
             while (remaining.Count > 0)
@@ -647,7 +672,7 @@ public sealed class ProxyServer : IAsyncDisposable
                 _statistics.AddRace();
 
                 var win = await _racer
-                    .RaceAsync(batch, port, settings.RaceConnectTimeoutMs, settings.RaceBatchBudgetMs, budgetToken)
+                    .RaceAsync(batch, port, settings.RaceConnectTimeoutMs, settings.RaceBatchBudgetMs, budgetToken, OnFailure)
                     .ConfigureAwait(false);
 
                 if (win is { } winner)
@@ -659,6 +684,7 @@ public sealed class ProxyServer : IAsyncDisposable
 
                 if (budgetToken.IsCancellationRequested)
                 {
+                    LogRaceFailures(host, port, candidates.Count, failures, "首连预算用尽");
                     return (null, PoolOutcome.BudgetExpired);
                 }
             }
@@ -696,7 +722,42 @@ public sealed class ProxyServer : IAsyncDisposable
             return (null, PoolOutcome.BudgetExpired);
         }
 
+        LogRaceFailures(host, port, candidates.Count, failures, "候选全部建连失败");
         return (null, PoolOutcome.CandidatesFailed);
+    }
+
+    /// <summary>
+    /// 选路失败时把「试了哪些地址、各自卡了多久」写进日志。
+    ///
+    /// 这三个数字能把三种完全不同的故障区分开，而它们在 UI 上都只表现为「打不开」：
+    /// <list type="bullet">
+    /// <item>失败耗时 2000ms 以上 → 上游不可达（SYN 无响应），是链路问题，调参没用；</item>
+    /// <item>失败耗时几十毫秒、全是 ConnectionRefused → 候选是投毒地址，该修地址过滤；</item>
+    /// <item>候选都没来得及失败（列表为空）→ 预算确实太小，或者候选太少落在单点上。</item>
+    /// </list>
+    /// </summary>
+    private void LogRaceFailures(
+        string host,
+        int port,
+        int candidateCount,
+        List<(IPAddress Ip, long ElapsedMs)> failures,
+        string reason)
+    {
+        lock (failures)
+        {
+            if (failures.Count == 0)
+            {
+                _log.Debug($"{host}:{port} {reason}：候选 {candidateCount} 个，均未完成建连就被取消");
+                return;
+            }
+
+            var ordered = failures.OrderByDescending(f => f.ElapsedMs).ToList();
+            var preview = string.Join(", ", ordered.Take(6).Select(f => $"{f.Ip}({f.ElapsedMs}ms)"));
+
+            _log.Debug(
+                $"{host}:{port} {reason}：候选 {candidateCount} 个，{ordered.Count} 个失败，"
+                + $"耗时 {ordered[^1].ElapsedMs}~{ordered[0].ElapsedMs}ms → {preview}");
+        }
     }
 
     private async Task<TcpClient> ConnectDirectAsync(

@@ -112,17 +112,17 @@ dotnet publish src/GHT/GHT.csproj -c Release -r win-x64 --self-contained false `
 | `ProxyPort` | `7890` | 本地监听端口，仅绑定 `127.0.0.1` |
 | `GlobalDnsWhitelist` | GitHub 相关 16 条 | 逗号或换行分隔，支持 `*` 通配；**可清空**，清空即全部走系统 DNS |
 | `DnsAccelEnabled` | `true` | 总开关 |
-| `ConnectBudgetMs` | `1500` | 首连预算；`0` = 不限（等价旧行为，作为回滚开关） |
+| `ConnectBudgetMs` | `3000` | 首连预算；`0` = 不限（等价旧行为，作为回滚开关）。应略大于单个地址的失败耗时，否则竞速会被掐断而给不出结论 |
 | `FallbackOnCandidatesFailed` | `true` | 加速池候选全部连不上时，再用系统 DNS 兜底；`false` = 直接 502（严格语义） |
 | `RaceMaxIps` | `8` | 单批并发竞速的 IP 数 |
 | `RaceConnectTimeoutMs` | `5000` | 单个 IP 建连超时 |
-| `RaceBatchBudgetMs` | `6000` | 单批竞速总预算 |
+| `RaceBatchBudgetMs` | `3000` | 单批竞速总预算（应小于 `ConnectBudgetMs`，否则永远不会生效） |
 | `RaceRetryRounds` | `2` | 全批失败后的重赛轮数 |
 | `RaceRetryDelayMs` | `800` | 重赛前等待（给后台扫描补候选的机会） |
 | `DnsScanConcurrency` | `128` | 扫描公共 DNS 的并发数 |
 | `DnsScanTimeoutMs` | `2000` | 单次 DNS 查询超时 |
 | `DnsCacheMinTtlSec` / `DnsCacheMaxTtlSec` | `60` / `600` | 解析结果缓存 TTL 区间（逐地址计时） |
-| `FirstBatchCollectMs` | `200` | 首批窗口：到点无论凑够几个都先返回（`0` = 拿到第一个答案就返回） |
+| `FirstBatchCollectMs` | `600` | 首批窗口：到点无论凑够几个都先返回（`0` = 拿到第一个答案就返回）。过小会让首批只拿到国内 DNS 的趋同答案，候选退化成单点 |
 | `FirstBatchMinIps` | `5` | 首批凑够几个 IP 就提前返回 |
 | `PoolResolveConcurrency` | `24` | 后台补齐时并发使用的 DNS 数量 |
 | `PreferIpv4` | `true` | 候选排序优先 IPv4 |
@@ -152,11 +152,11 @@ src/GHT/
 └── Services/
     ├── ProxyServer.cs         接入、选路编排、隧道与明文转发
     ├── ProxyProtocol.cs       HTTP 常量、逐跳头规则、错误响应
-    ├── UpstreamRacer.cs       TCP 建连竞速 + 地址健康度
+    ├── UpstreamRacer.cs       TCP 建连竞速 + 地址健康度（跨进程持久化）
     ├── ResolverHub.cs         域名 → 候选 IP（预算语义、后台扫描、渐进缓存、DNS 健康度）
     ├── Diagnostics/           域名诊断（复用 DNS 扫描与竞速，产出可复制报告）
     ├── Http/                  请求头解析、前置缓冲流、带缓冲的行读取流
-    ├── Dns/                   DNS 报文编解码、UDP 客户端、扫描器、结果缓存、内置清单
+    ├── Dns/                   DNS 报文编解码、UDP 客户端、扫描器、结果缓存、地址合法性判定、内置清单
     ├── SystemProxy.cs         系统代理注册表读写 + WinINet 刷新
     ├── SettingsStore.cs       配置读写与越界收敛
     ├── SingleInstance.cs      Mutex + 命名管道唤出
@@ -167,8 +167,8 @@ src/GHT/
     └── LogService.cs          异步批量落盘 + 按天分文件 + 大小轮转 + 内存缓冲
 
 tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平台运行）
-└── HttpHead / ChunkedBody / DnsMessage / DnsResultCache / ResolverHub
-    / ProxyStatistics / LogService / DomainWildcardList / Settings
+└── HttpHead / ChunkedBody / DnsMessage / DnsResultCache / AddressPolicy / ResolverHub
+    / UpstreamRacer / ProxyStatistics / LogService / DomainWildcardList / Settings
 ```
 
 ---
@@ -177,19 +177,42 @@ tests/GHT.Tests/               纯逻辑单元测试（链接源码，可跨平�
 
 | 工作流 | 触发 | 做了什么 |
 |---|---|---|
-| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（89 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
+| `build.yml` | push / PR 到 `main`、手动 | `windows-latest` + .NET 8 SDK → restore → build → **dotnet test（131 例）** → publish 单文件 exe → 上传 `GHT-win-x64` artifact |
 | `release.yml` | 推送 `v*` 标签 | 同上构建，打包 zip 并创建 GitHub Release |
 
 发布新版本：
 
 ```bash
-git tag v1.2.0
-git push origin v1.2.0
+git tag v1.3.0
+git push origin v1.3.0
 ```
 
 ---
 
-## 七、已知边界
+## 七、候选质量与地址健康度
+
+「首连预算用尽」这条日志的含义是：**预算内一个候选都没连上**。它本身是降级动作，不是故障原因；病因通常在候选质量上。因此有三道处理：
+
+**1. 不可路由地址在入池前就丢弃**（`Services/Dns/AddressPolicy.cs`）
+
+投毒/被劫持的公共 DNS 会返回 `127.0.0.1`、`0.0.0.0`、`198.51.44.8`（TEST-NET-2）这类地址。它们「答得很积极」，于是永远排在首批，而答案永远连不上 —— 一批 8 个竞速名额就这样被白白占掉。过滤范围只限明确不可路由的段（回环、未指定、私有、CGNAT、链路本地、文档段、组播、保留段；IPv6 只收 `2000::/3`），**不**做「看着像内网就丢」的猜测：`20.x.x.x`、`185.199.x.x` 是 GitHub 自己的入口，误杀会直接断掉加速。
+
+**2. 「答错」的责任归到那台 DNS 上**
+
+`ResolverHub` 记录「候选 IP → 首个给出它的 DNS」。竞速判定某地址连不上时，通过 `ReportBadAnswer` 给该 DNS 记一次失败（独立的 `Bad` 计数），排序时按**双倍权重**参与降级判定。效果是「答得出且答得对」的 DNS 会逐渐顶替「答得出但答错」的。只降权、不剔除：池里若全是劣质 DNS，直接剔除会让人彻底连不上。
+
+**3. 地址健康度跨进程存活**（`%LOCALAPPDATA%\GHT\address-health.json`）
+
+失败次数、建连耗时 EWMA、最后失败时间（Unix 毫秒）在停止时落盘、启动时加载。否则每次重启都要用首连预算重新试错一遍 —— 日志里「首连预算用尽」大量集中在启动后几分钟，正是这个原因。
+
+另外两个与预算直接相关的修正：
+
+- **预算取消不再记为地址失败**。旧实现里竞速胜出后 `scope.Cancel()` 会让其余候选全部走进 `catch` 并各记一次失败，好地址被反复记失败，健康度被系统性污染。现在取消与真实失败在 `catch (OperationCanceledException) when (token.IsCancellationRequested)` 上分流。
+- **预算用尽时打印失败明细**：候选数、失败个数、耗时区间与前几个 `IP(xxms)`。这三个数字能把「上游不可达（2000ms+）」「投毒地址（几十毫秒 ConnectionRefused）」「预算确实太小（失败列表为空）」三种情况分开。
+
+---
+
+## 八、已知边界
 
 - **仅 Windows 10/11 x64**：WPF + 注册表 + 托盘，跨平台需重写宿主层。
 - **仅 HTTP/1.1**：不支持 h2，浏览器会对代理自动降级。
@@ -206,7 +229,7 @@ git push origin v1.2.0
 
 ---
 
-## 八、许可与来源
+## 九、许可与来源
 
 本项目以 MIT 许可发布，详见 [LICENSE](LICENSE)。
 

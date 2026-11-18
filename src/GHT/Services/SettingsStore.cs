@@ -104,17 +104,17 @@ public static class SettingsStore
     public static AppSettings Normalize(AppSettings settings)
     {
         settings.ProxyPort = Clamp(settings.ProxyPort, 1024, 65535, 7890);
-        settings.ConnectBudgetMs = Clamp(settings.ConnectBudgetMs, 0, 60_000, 1500);
+        settings.ConnectBudgetMs = Clamp(settings.ConnectBudgetMs, 0, 60_000, 3000);
         settings.RaceMaxIps = Clamp(settings.RaceMaxIps, 1, 64, 8);
         settings.RaceConnectTimeoutMs = Clamp(settings.RaceConnectTimeoutMs, 200, 60_000, 5000);
-        settings.RaceBatchBudgetMs = Clamp(settings.RaceBatchBudgetMs, 200, 120_000, 6000);
+        settings.RaceBatchBudgetMs = Clamp(settings.RaceBatchBudgetMs, 200, 120_000, 3000);
         settings.RaceRetryRounds = Clamp(settings.RaceRetryRounds, 0, 5, 2);
         settings.RaceRetryDelayMs = Clamp(settings.RaceRetryDelayMs, 100, 60_000, 800);
         settings.DnsScanConcurrency = Clamp(settings.DnsScanConcurrency, 1, 1024, 128);
         settings.DnsScanTimeoutMs = Clamp(settings.DnsScanTimeoutMs, 200, 20_000, 2000);
         settings.DnsCacheMinTtlSec = Clamp(settings.DnsCacheMinTtlSec, 5, 86_400, 60);
         settings.DnsCacheMaxTtlSec = Clamp(settings.DnsCacheMaxTtlSec, settings.DnsCacheMinTtlSec, 86_400, 600);
-        settings.FirstBatchCollectMs = Clamp(settings.FirstBatchCollectMs, 0, 5000, 200);
+        settings.FirstBatchCollectMs = Clamp(settings.FirstBatchCollectMs, 0, 5000, 600);
         settings.FirstBatchMinIps = Clamp(settings.FirstBatchMinIps, 1, 64, 5);
         settings.PoolResolveConcurrency = Clamp(settings.PoolResolveConcurrency, 1, 256, 24);
 
