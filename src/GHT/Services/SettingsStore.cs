@@ -266,6 +266,17 @@ public static class SettingsStore
         var defaults = new AppSettings();
 
         settings.ProxyPort = Clamp(settings.ProxyPort, 1024, 65535, defaults.ProxyPort);
+        settings.MaxConcurrentConnections = Clamp(
+            settings.MaxConcurrentConnections, 0, 8192, defaults.MaxConcurrentConnections);
+        settings.MaxConnectionsPerHost = Clamp(
+            settings.MaxConnectionsPerHost, 0, 1024, defaults.MaxConnectionsPerHost);
+
+        // 单主机上限大于全局上限时它永远不生效（全局先拒绝了），按全局收敛，避免留下一个「假设置」
+        if (settings.MaxConcurrentConnections > 0
+            && settings.MaxConnectionsPerHost > settings.MaxConcurrentConnections)
+        {
+            settings.MaxConnectionsPerHost = settings.MaxConcurrentConnections;
+        }
         settings.ConnectBudgetMs = Clamp(settings.ConnectBudgetMs, 0, 60_000, defaults.ConnectBudgetMs);
         settings.RaceMaxIps = Clamp(settings.RaceMaxIps, 1, 64, defaults.RaceMaxIps);
         settings.RaceConnectTimeoutMs = Clamp(settings.RaceConnectTimeoutMs, 200, 60_000, defaults.RaceConnectTimeoutMs);

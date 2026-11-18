@@ -74,6 +74,18 @@ public sealed class ProxyServer : IAsyncDisposable
     /// <summary>强关之后给处理循环收尾的时间，用于把统计与日志写完。</summary>
     private const int ForceCloseGraceMs = 500;
 
+    /// <summary>
+    /// 超限时写 503 的超时。给个短上限是为了让拒绝路径自身不堆积：
+    /// 客户端如果不读响应，写操作会把任务挂在这里，而那些任务是要占内存的。
+    /// </summary>
+    private const int RejectWriteMs = 2000;
+
+    /// <summary>拒绝路径的并发槽位。超出就静默关闭，避免「拒绝」本身变成内存压力源。</summary>
+    private const int RejectSlots = 16;
+
+    /// <summary>「并发已达上限」日志的最小间隔：洪峰下每个被拒连接都写一行会把日志刷爆。</summary>
+    private const int OverloadLogIntervalMs = 10_000;
+
     private enum LifecycleState
     {
         Stopped,
@@ -149,7 +161,16 @@ public sealed class ProxyServer : IAsyncDisposable
     /// <summary>活跃连接表。只在接入时增加、处理结束时移除，停止时用于有界收尾。</summary>
     private readonly ConcurrentDictionary<long, ConnectionState> _connections = new();
 
+    /// <summary>并发准入闸门（全局 + 按上游主机），见 <see cref="ConnectionBudget"/>。</summary>
+    private readonly ConnectionBudget _budget = new();
+
+    /// <summary>拒绝路径的并发上限。拿不到槽位就直接关连接，不排队。</summary>
+    private readonly SemaphoreSlim _rejectSlots = new(RejectSlots, RejectSlots);
+
+    private readonly RuntimeMetrics _metrics = new();
+
     private long _connectionSeq;
+    private long _lastOverloadLogMs;
 
     private volatile AppSettings _settings;
     private volatile DomainWildcardList _whitelist;
@@ -332,6 +353,26 @@ public sealed class ProxyServer : IAsyncDisposable
     /// <summary>当前仍在处理的连接数（诊断与测试用）。</summary>
     public int ActiveConnections => _connections.Count;
 
+    /// <summary>当前占用全局名额的连接数（含「已接入、还在读请求头」的那些）。</summary>
+    public int BudgetedConnections => _budget.Total;
+
+    /// <summary>因超出并发上限而被拒绝的累计次数。</summary>
+    public long RejectedConnections => _budget.RejectedTotal;
+
+    /// <summary>
+    /// 采样一次运行期指标。全部是 O(1) 读数，可以在 UI 的每秒刷新里直接调用。
+    /// </summary>
+    public RuntimeMetricsSample SampleMetrics() => _metrics.Sample(
+        BudgetedConnections,
+        _settings.MaxConcurrentConnections,
+        _budget.RejectedTotal,
+        _resolver.CachedDomainCount,
+        _resolver.TrackedSweepCount,
+        _resolver.ServerHealthCount,
+        _racer.HealthCount,
+        _resolver.IpSourceCount,
+        _log.QueueDepth);
+
     /// <summary>
     /// 让活跃连接在 <see cref="StopDrainMs"/> 内自行退出，超时则强制关闭两端并再给一点收尾时间。
     ///
@@ -410,10 +451,94 @@ public sealed class ProxyServer : IAsyncDisposable
             var state = new ConnectionState(client);
             var id = Interlocked.Increment(ref _connectionSeq);
 
+            // 先过闸门再登记：超限时不再为这条连接创建处理任务。
+            // 旧实现是无条件 Task.Run，活跃连接数只受客户端约束 —— 一条病态连接复用、
+            // 或者页面里挂着大量长连接时，内存没有任何上界。
+            var maxConnections = _settings.MaxConcurrentConnections;
+            if (!_budget.TryEnter(maxConnections))
+            {
+                RejectOverload(client, maxConnections);
+                continue;
+            }
+
             // 先登记再启动：反过来的话，停止流程可能刚好在「已启动、未登记」的窗口里扫过连接表。
             _connections[id] = state;
             state.Task = Task.Run(() => RunConnectionAsync(id, state, token), CancellationToken.None);
         }
+    }
+
+    /// <summary>
+    /// 超限时给客户端一个明确的 503，而不是静默断开 —— 浏览器能立刻分辨「代理拒绝」与「网络坏了」。
+    ///
+    /// 但拒绝路径本身也必须<b>有界</b>：每写一个响应就要一个任务，洪峰下这些任务本身就是内存压力。
+    /// 所以只有拿到拒绝槽位时才写 503，拿不到就直接关闭连接（客户端看到重置，代价比把进程拖死小得多）。
+    /// </summary>
+    private void RejectOverload(TcpClient client, int max)
+    {
+        LogOverload(max);
+
+        if (!_rejectSlots.Wait(0))
+        {
+            try
+            {
+                client.Dispose();
+            }
+            catch
+            {
+                // ignore
+            }
+
+            return;
+        }
+
+        _ = Task.Run(
+            async () =>
+            {
+                try
+                {
+                    using (client)
+                    using (var timeout = new CancellationTokenSource(RejectWriteMs))
+                    {
+                        await WriteErrorAsync(
+                                client.GetStream(),
+                                503,
+                                "Service Unavailable",
+                                $"并发连接数已达上限（{max}），请稍后重试或提高上限",
+                                timeout.Token)
+                            .ConfigureAwait(false);
+                    }
+                }
+                catch
+                {
+                    // 客户端已断开：拒绝本身不需要报告
+                }
+                finally
+                {
+                    _rejectSlots.Release();
+                }
+            },
+            CancellationToken.None);
+    }
+
+    /// <summary>限频记录「达到上限」：洪峰下每个被拒连接都写一行会把日志和 UI 一起刷爆。</summary>
+    private void LogOverload(int max)
+    {
+        var now = Environment.TickCount64;
+        var last = Volatile.Read(ref _lastOverloadLogMs);
+
+        if (now - last < OverloadLogIntervalMs)
+        {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _lastOverloadLogMs, now, last) != last)
+        {
+            return;
+        }
+
+        _log.Warn(
+            $"并发连接数已达上限 {max}（当前 {_budget.Total}，主机 {_budget.TrackedHosts} 个），"
+            + $"新连接返回 503；累计拒绝 {_budget.RejectedTotal}");
     }
 
     private async Task RunConnectionAsync(long id, ConnectionState state, CancellationToken token)
@@ -425,6 +550,9 @@ public sealed class ProxyServer : IAsyncDisposable
         finally
         {
             _connections.TryRemove(id, out _);
+
+            // 名额必须在处理完全结束后才归还，否则「正在收尾」的连接会短暂不被计数
+            _budget.Exit();
         }
     }
 
@@ -475,7 +603,7 @@ public sealed class ProxyServer : IAsyncDisposable
 
                 if (string.Equals(head.Method, "CONNECT", StringComparison.OrdinalIgnoreCase))
                 {
-                    await HandleConnectAsync(state, stream, body, head, token).ConfigureAwait(false);
+                    await HandleConnectAsync(state, stream, head, token).ConfigureAwait(false);
                 }
                 else
                 {
@@ -508,7 +636,6 @@ public sealed class ProxyServer : IAsyncDisposable
     private async Task HandleConnectAsync(
         ConnectionState state,
         Stream clientStream,
-        Stream clientInput,
         HttpHead head,
         CancellationToken token)
     {
@@ -519,6 +646,39 @@ public sealed class ProxyServer : IAsyncDisposable
             return;
         }
 
+        var perHostLimit = _settings.MaxConnectionsPerHost;
+
+        if (!_budget.TryEnterHost(host, perHostLimit, out var lease))
+        {
+            _log.Debug($"{host}:{port} 已达单主机并发上限 {perHostLimit}，拒绝新隧道");
+            await WriteErrorAsync(
+                    clientStream,
+                    503,
+                    "Service Unavailable",
+                    $"{host} 的并发连接数已达上限（{perHostLimit}）",
+                    token)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            await TunnelToAsync(state, clientStream, host, port, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            lease.Dispose();
+        }
+    }
+
+    /// <summary>建连并双向转发。调用方已持有该主机的并发租约。</summary>
+    private async Task TunnelToAsync(
+        ConnectionState state,
+        Stream clientStream,
+        string host,
+        int port,
+        CancellationToken token)
+    {
         var connectWatch = Stopwatch.StartNew();
         TcpClient upstream;
 
@@ -592,6 +752,40 @@ public sealed class ProxyServer : IAsyncDisposable
             return;
         }
 
+        var perHostLimit = _settings.MaxConnectionsPerHost;
+
+        if (!_budget.TryEnterHost(uri.Host, perHostLimit, out var lease))
+        {
+            _log.Debug($"{uri.Host}:{uri.Port} 已达单主机并发上限 {perHostLimit}，拒绝明文请求");
+            await WriteErrorAsync(
+                    clientStream,
+                    503,
+                    "Service Unavailable",
+                    $"{uri.Host} 的并发连接数已达上限（{perHostLimit}）",
+                    token)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            await RelayPlainAsync(state, clientStream, clientInput, head, uri, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            lease.Dispose();
+        }
+    }
+
+    /// <summary>把明文请求转发到上游。调用方已持有该主机的并发租约。</summary>
+    private async Task RelayPlainAsync(
+        ConnectionState state,
+        Stream clientStream,
+        Stream clientInput,
+        HttpHead head,
+        Uri uri,
+        CancellationToken token)
+    {
         var connectWatch = Stopwatch.StartNew();
         TcpClient upstream;
 

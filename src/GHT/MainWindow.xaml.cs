@@ -77,7 +77,7 @@ public partial class MainWindow : Window
         FallbackCheck.Unchecked += OnFallbackChanged;
         CloseActionBox.SelectionChanged += OnCloseActionChanged;
 
-        foreach (var box in new[] { RaceMaxIpsBox, BudgetBox, RaceTimeoutBox, RetryRoundsBox, ScanConcurrencyBox, ScanTimeoutBox })
+        foreach (var box in new[] { RaceMaxIpsBox, BudgetBox, RaceTimeoutBox, RetryRoundsBox, ScanConcurrencyBox, ScanTimeoutBox, MaxConnectionsBox })
         {
             box.LostFocus += OnTuningLostFocus;
         }
@@ -132,6 +132,7 @@ public partial class MainWindow : Window
             RetryRoundsBox.Text = _settings.RaceRetryRounds.ToString(CultureInfo.InvariantCulture);
             ScanConcurrencyBox.Text = _settings.DnsScanConcurrency.ToString(CultureInfo.InvariantCulture);
             ScanTimeoutBox.Text = _settings.DnsScanTimeoutMs.ToString(CultureInfo.InvariantCulture);
+            MaxConnectionsBox.Text = _settings.MaxConcurrentConnections.ToString(CultureInfo.InvariantCulture);
             FallbackCheck.IsChecked = _settings.FallbackOnCandidatesFailed;
 
             // 自启状态以注册表为准：可能被组策略或用户手工改过，配置里的值不一定可信。
@@ -574,6 +575,7 @@ public partial class MainWindow : Window
         _settings.RaceRetryRounds = ParseInt(RetryRoundsBox, _settings.RaceRetryRounds);
         _settings.DnsScanConcurrency = ParseInt(ScanConcurrencyBox, _settings.DnsScanConcurrency);
         _settings.DnsScanTimeoutMs = ParseInt(ScanTimeoutBox, _settings.DnsScanTimeoutMs);
+        _settings.MaxConcurrentConnections = ParseInt(MaxConnectionsBox, _settings.MaxConcurrentConnections);
 
         SettingsStore.Normalize(_settings);
 
@@ -594,6 +596,8 @@ public partial class MainWindow : Window
         _settings.RaceRetryDelayMs = defaults.RaceRetryDelayMs;
         _settings.DnsScanConcurrency = defaults.DnsScanConcurrency;
         _settings.DnsScanTimeoutMs = defaults.DnsScanTimeoutMs;
+        _settings.MaxConcurrentConnections = defaults.MaxConcurrentConnections;
+        _settings.MaxConnectionsPerHost = defaults.MaxConnectionsPerHost;
         _settings.PoolResolveConcurrency = defaults.PoolResolveConcurrency;
         _settings.FirstBatchCollectMs = defaults.FirstBatchCollectMs;
         _settings.FirstBatchMinIps = defaults.FirstBatchMinIps;
@@ -618,6 +622,7 @@ public partial class MainWindow : Window
         RetryRoundsBox.Text = _settings.RaceRetryRounds.ToString(CultureInfo.InvariantCulture);
         ScanConcurrencyBox.Text = _settings.DnsScanConcurrency.ToString(CultureInfo.InvariantCulture);
         ScanTimeoutBox.Text = _settings.DnsScanTimeoutMs.ToString(CultureInfo.InvariantCulture);
+        MaxConnectionsBox.Text = _settings.MaxConcurrentConnections.ToString(CultureInfo.InvariantCulture);
         FallbackCheck.IsChecked = _settings.FallbackOnCandidatesFailed;
     }
 
@@ -857,6 +862,7 @@ public partial class MainWindow : Window
             $" · 首连 P50 {stats.ConnectP50Ms}ms / P95 {stats.ConnectP95Ms}ms";
 
         text += Environment.NewLine + BuildFallbackLine(stats);
+        text += Environment.NewLine + BuildMetricsLine();
 
         if (!string.IsNullOrEmpty(stats.LastWinner))
         {
@@ -894,6 +900,36 @@ public partial class MainWindow : Window
         return $"回落 {fallbacks} = 预算 {stats.FallbackBudget} / 空池 {stats.FallbackPoolEmpty}" +
                $" / 无答案 {stats.FallbackNoAnswer} / 候选耗尽 {stats.FallbackCandidates}" +
                $"　→ 系统 DNS 成功 {stats.FallbackDirectOk}/{attempted}（{rate:0}%）均 {stats.FallbackDirectAvgMs}ms";
+    }
+
+    /// <summary>
+    /// 运行期内存与并发的一行摘要。
+    ///
+    /// 这些数字是判断「能不能长期挂着」的唯一依据：托管堆、分配速率、GC 次数，
+    /// 加上各字典的条目数与日志队列深度 —— 任何一项单调增长，都说明有一处没被回收。
+    /// 采样全部是 O(1) 读数，放在每秒一次的刷新里不会影响代理本身。
+    /// </summary>
+    private string BuildMetricsLine()
+    {
+        var proxy = _proxy;
+
+        if (proxy is null)
+        {
+            return "内存 —";
+        }
+
+        var metrics = proxy.SampleMetrics();
+        var heap = metrics.ManagedHeapBytes / (1024.0 * 1024);
+        var rate = metrics.AllocRateBytesPerSec / (1024.0 * 1024);
+        var limit = metrics.MaxConnections > 0
+            ? metrics.MaxConnections.ToString(CultureInfo.InvariantCulture)
+            : "不限";
+
+        return $"内存 {heap:0.0}MB · 分配 {rate:0.0}MB/s · GC {metrics.Gen0}/{metrics.Gen1}/{metrics.Gen2}" +
+               $" · 连接 {metrics.ActiveConnections}/{limit}（拒绝 {metrics.RejectedConnections}）" +
+               $" · 缓存 {metrics.CachedDomains} · 扫描 {metrics.TrackedSweeps} · DNS {metrics.ServerHealth}" +
+               $" · 地址 {metrics.AddressHealth} · 来源 {metrics.IpSources} · 日志 {metrics.LogQueueDepth}" +
+               $" · 线程池排队 {metrics.ThreadPoolPending}";
     }
 
     private void UpdateTraySpeed(double upRate, double downRate)

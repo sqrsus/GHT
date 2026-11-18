@@ -20,8 +20,21 @@ public sealed class LogService : IDisposable
     private const int RetentionDays = 14;
     private const int MaxLineLength = 4000;
 
-    /// <summary>队列上限。写盘持续落后时丢最旧的（宁可丢早期日志，也要保住现场最近的记录）。</summary>
-    private const int QueueCapacity = 8192;
+    /// <summary>
+    /// 最近日志的字符总量上限（约 512K 字符 ≈ 1MB）。
+    ///
+    /// 只按条数限制是不够的：单行最长 4000 字符，500 条最坏就是 2MB；
+    /// 而 DEBUG 行在竞速/首连路径上非常密集，实际分布远比「每行几十字」糟糕。
+    /// 双重上限（条数 + 字符数）才能给出一个真正封顶的内存占用。
+    /// </summary>
+    private const long RecentMaxChars = 512 * 1024;
+
+    /// <summary>
+    /// 队列上限。写盘持续落后时丢最旧的（宁可丢早期日志，也要保住现场最近的记录）。
+    /// 从 8192 收到 2048：单行最坏 4000 字符，8192 条的极端占用是 32MB 量级，
+    /// 而正常运行时（每行约 100 字符）2048 条也足够覆盖一次完整的首连过程。
+    /// </summary>
+    private const int QueueCapacity = 2048;
 
     /// <summary>单批最大字节数：避免一次拼出巨大的字符串。</summary>
     private const int MaxBatchChars = 64 * 1024;
@@ -36,6 +49,12 @@ public sealed class LogService : IDisposable
     private readonly Task _writer;
     private readonly string _directory;
     private readonly Queue<string> _recent = new();
+
+    /// <summary>
+    /// 环形缓冲里当前保存的字符总数。只由 <see cref="_recentGate"/> 保护 ——
+    /// 它的用途是把「最多 2MB 的条数上限」压成「最多 1MB 的字符上限」。
+    /// </summary>
+    private long _recentChars;
 
     private string _currentDate = string.Empty;
     private string _currentFile = string.Empty;
@@ -69,6 +88,21 @@ public sealed class LogService : IDisposable
 
     /// <summary>因队列满或已关闭而被丢弃的行数（仅用于诊断，不进日志本身）。</summary>
     public long Dropped => Interlocked.Read(ref _dropped);
+
+    /// <summary>待写盘的行数（诊断与内存指标用）。</summary>
+    public int QueueDepth => _queue.Reader.Count;
+
+    /// <summary>最近日志缓冲当前的字符总量（诊断与测试用）。</summary>
+    internal long RecentChars
+    {
+        get
+        {
+            lock (_recentGate)
+            {
+                return _recentChars;
+            }
+        }
+    }
 
     public void Debug(string message) => Write("DEBUG", message);
 
@@ -124,9 +158,13 @@ public sealed class LogService : IDisposable
         lock (_recentGate)
         {
             _recent.Enqueue(line);
-            while (_recent.Count > RecentCapacity)
+            _recentChars += line.Length;
+
+            // 条数与字符数双上限：只按条数控制时，最坏情况是 500 × 4000 字符 = 2MB
+            while (_recent.Count > 0 && (_recent.Count > RecentCapacity || _recentChars > RecentMaxChars))
             {
-                _recent.Dequeue();
+                var evicted = _recent.Dequeue();
+                _recentChars -= evicted.Length;
             }
         }
 

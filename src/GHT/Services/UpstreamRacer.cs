@@ -41,13 +41,36 @@ public enum AddressFailureKind
 public sealed class UpstreamRacer
 {
     /// <summary>等待落败任务自我清理的上限。取消后它们通常立刻结束。</summary>
-    private static readonly TimeSpan ReapTimeout = TimeSpan.FromSeconds(2);
+    /// <remarks>
+    /// 从 2 秒收到 1 秒：竞速胜出后其余尝试已经拿到取消信号，正常路径在几十毫秒内就结束了。
+    /// 留 2 秒只是让「胜出后还要等 2 秒才返回」变成常态，期间那批任务与它们的 socket 都还在。
+    /// 超时后不强行拆任务 —— 它们自己的 catch 分支会 Dispose。
+    /// </remarks>
+    private static readonly TimeSpan ReapTimeout = TimeSpan.FromSeconds(1);
 
     /// <summary>失败退避上限：连坏 5 次以上就不再额外惩罚，避免永久拉黑一个其实能用的地址。</summary>
     private const int MaxBackoffSeconds = 60;
 
+    /// <summary>
+    /// 健康度条目上限。长期访问大量域名会持续引入新 IP，没有上限时这张表会一路涨。
+    /// 4096 对「几百个常用域名 × 每个几十个地址」是足够的，超出的多半是早已不再出现的旧地址。
+    /// </summary>
+    private const int MaxHealthEntries = 4096;
+
+    /// <summary>超过这个时长没再出现的地址直接淘汰（30 天足够覆盖一次长假）。</summary>
+    private static readonly long EvictAfterMs = (long)TimeSpan.FromDays(30).TotalMilliseconds;
+
+    /// <summary>写盘时的条目上限：文件只是「让下次启动少走弯路」的优化，不值得写成几 MB。</summary>
+    private const int MaxPersistedEntries = 2048;
+
     private readonly LogService _log;
     private readonly ConcurrentDictionary<string, AddressHealth> _health = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 健康表条目计数。自己维护是因为 <c>ConcurrentDictionary.Count</c> 要拿全表的锁，
+    /// 而「是否超限」这个判断就发生在每次建连尝试的路径上。
+    /// </summary>
+    private int _healthCount;
 
     /// <summary>
     /// 建连动作。生产环境就是真 socket；测试可注入确定性实现。
@@ -84,7 +107,16 @@ public sealed class UpstreamRacer
 
         /// <summary>建连耗时指数滑动平均；负数表示还没有样本。</summary>
         public double EwmaMs = -1;
+
+        /// <summary>
+        /// 最后一次「成功或失败」的 Unix 毫秒时间戳，只用于淘汰长期不再出现的地址。
+        /// 与 <see cref="LastFailureUnixMs"/> 分开：后者参与退避计算，不能被成功事件刷新。
+        /// </summary>
+        public long LastSeenUnixMs;
     }
+
+    /// <summary>健康度条目数（诊断与测试用）。</summary>
+    public int HealthCount => Volatile.Read(ref _healthCount);
 
     public async Task<RaceWin?> RaceAsync(
         IReadOnlyList<IPAddress> candidates,
@@ -303,16 +335,94 @@ public sealed class UpstreamRacer
 
     private void RecordSuccess(IPAddress address, double milliseconds)
     {
-        var health = _health.GetOrAdd(address.ToString(), _ => new AddressHealth());
+        var health = GetHealth(address.ToString());
         health.Failures = 0;
         health.EwmaMs = health.EwmaMs < 0 ? milliseconds : (health.EwmaMs * 0.7) + (milliseconds * 0.3);
+        health.LastSeenUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        PruneIfNeeded();
     }
 
     private void RecordFailure(IPAddress address)
     {
-        var health = _health.GetOrAdd(address.ToString(), _ => new AddressHealth());
+        var health = GetHealth(address.ToString());
         health.Failures++;
-        Volatile.Write(ref health.LastFailureUnixMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        Volatile.Write(ref health.LastFailureUnixMs, now);
+        health.LastSeenUnixMs = now;
+
+        PruneIfNeeded();
+    }
+
+    /// <summary>取（必要时创建）某个地址的健康记录。只有真的插入才计数，避免并发下工厂多跑把计数抬高。</summary>
+    private AddressHealth GetHealth(string key)
+    {
+        if (_health.TryGetValue(key, out var existing))
+        {
+            return existing;
+        }
+
+        var fresh = new AddressHealth();
+
+        if (_health.TryAdd(key, fresh))
+        {
+            Interlocked.Increment(ref _healthCount);
+            return fresh;
+        }
+
+        return _health.TryGetValue(key, out existing) ? existing : fresh;
+    }
+
+    /// <summary>
+    /// 健康表的上限维护。先淘汰 30 天没再出现的地址，再按最久未见淘汰到 3/4 ——
+    /// 一次淘汰到 3/4 而不是刚好压线，是为了让这项 O(n) 操作摊薄到多次调用上。
+    /// </summary>
+    private void PruneIfNeeded()
+    {
+        if (Volatile.Read(ref _healthCount) <= MaxHealthEntries)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var cutoff = now - EvictAfterMs;
+
+        foreach (var pair in _health)
+        {
+            if (Volatile.Read(ref pair.Value.LastSeenUnixMs) < cutoff)
+            {
+                RemoveHealth(pair);
+            }
+        }
+
+        if (Volatile.Read(ref _healthCount) <= MaxHealthEntries)
+        {
+            return;
+        }
+
+        var target = MaxHealthEntries - (MaxHealthEntries / 4);
+        var overflow = Volatile.Read(ref _healthCount) - target;
+
+        var stale = _health
+            .Select(pair => (Pair: pair, Seen: Volatile.Read(ref pair.Value.LastSeenUnixMs)))
+            .OrderBy(item => item.Seen)
+            .Take(overflow)
+            .ToArray();
+
+        foreach (var item in stale)
+        {
+            RemoveHealth(item.Pair);
+        }
+    }
+
+    /// <summary>按 key+value 精确移除，避免并发下把同一地址的新计数项误删。</summary>
+    private void RemoveHealth(KeyValuePair<string, AddressHealth> pair)
+    {
+        if (((ICollection<KeyValuePair<string, AddressHealth>>)_health).Remove(pair))
+        {
+            Interlocked.Decrement(ref _healthCount);
+        }
     }
 
     // ── 健康度持久化 ────────────────────────────────────────────────────
@@ -341,19 +451,42 @@ public sealed class UpstreamRacer
 
             var loaded = 0;
 
-            foreach (var pair in dto.Addresses)
+            // 文件可能来自很老的版本、也可能被手工改大：按「最近出现」排序后只取前 N 条。
+            // 这份数据只是启动优化，丢掉一部分不影响可用性，但不能让它把内存顶起来。
+            var candidates = dto.Addresses
+                .Where(pair => pair.Value is not null && !string.IsNullOrWhiteSpace(pair.Key))
+                .OrderByDescending(pair => pair.Value!.LastSeenMs)
+                .Take(MaxHealthEntries);
+
+            foreach (var pair in candidates)
             {
-                if (pair.Value is null || string.IsNullOrWhiteSpace(pair.Key))
+                var lastSeen = pair.Value!.LastSeenMs;
+
+                // 旧版文件没有 LastSeenMs：退回失败时间，再退回「现在」。
+                // 直接用 0 的话，下一次保存会把它当成 30 天前的条目整批丢掉。
+                if (lastSeen <= 0)
                 {
-                    continue;
+                    lastSeen = pair.Value.LastFailureMs > 0
+                        ? pair.Value.LastFailureMs
+                        : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 }
 
-                _health[pair.Key] = new AddressHealth
+                var health = new AddressHealth
                 {
                     Failures = Math.Clamp(pair.Value.Failures, 0, 100),
                     LastFailureUnixMs = pair.Value.LastFailureMs,
-                    EwmaMs = pair.Value.EwmaMs
+                    EwmaMs = pair.Value.EwmaMs,
+                    LastSeenUnixMs = lastSeen
                 };
+
+                if (_health.TryAdd(pair.Key, health))
+                {
+                    Interlocked.Increment(ref _healthCount);
+                }
+                else
+                {
+                    _health[pair.Key] = health;
+                }
 
                 loaded++;
             }
@@ -369,7 +502,13 @@ public sealed class UpstreamRacer
         }
     }
 
-    /// <summary>把健康度写盘。用 tmp + Move 覆盖，避免进程在中途被杀时留下半个文件。</summary>
+    /// <summary>
+    /// 把健康度写盘。用 tmp + 覆盖移动，避免进程在中途被杀时留下半个文件。
+    ///
+    /// 写盘前先做两件事：丢掉「没有任何样本」与「30 天没再出现」的条目，再按最近出现取前
+    /// <see cref="MaxPersistedEntries"/> 条。整份数据只是启动优化，不值得写成几 MB；
+    /// 序列化直接写到流上，也不再先拼一个完整字符串（那份字符串在大表下本身就是一次 GC 峰值）。
+    /// </summary>
     /// <param name="path">测试用；生产环境传 null 即用 <see cref="AppPaths.HealthFile"/>。</param>
     public void Save(string? path = null)
     {
@@ -377,12 +516,10 @@ public sealed class UpstreamRacer
         {
             path ??= AppPaths.HealthFile;
 
-            var dto = new HealthFileDto
-            {
-                Version = 1,
-                SavedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                Addresses = new Dictionary<string, HealthEntryDto>(_health.Count)
-            };
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var cutoff = now - EvictAfterMs;
+
+            var entries = new List<(string Ip, AddressHealth Health)>(Math.Min(_health.Count, MaxPersistedEntries));
 
             foreach (var pair in _health)
             {
@@ -394,11 +531,33 @@ public sealed class UpstreamRacer
                     continue;
                 }
 
-                dto.Addresses[pair.Key] = new HealthEntryDto
+                if (Volatile.Read(ref health.LastSeenUnixMs) < cutoff)
+                {
+                    continue;
+                }
+
+                entries.Add((pair.Key, health));
+            }
+
+            var dto = new HealthFileDto
+            {
+                Version = 2,
+                SavedAt = now,
+                Addresses = new Dictionary<string, HealthEntryDto>(
+                    Math.Min(entries.Count, MaxPersistedEntries),
+                    StringComparer.OrdinalIgnoreCase)
+            };
+
+            foreach (var (ip, health) in entries
+                         .OrderByDescending(item => Volatile.Read(ref item.Health.LastSeenUnixMs))
+                         .Take(MaxPersistedEntries))
+            {
+                dto.Addresses[ip] = new HealthEntryDto
                 {
                     Failures = health.Failures,
                     LastFailureMs = Volatile.Read(ref health.LastFailureUnixMs),
-                    EwmaMs = health.EwmaMs
+                    EwmaMs = health.EwmaMs,
+                    LastSeenMs = Volatile.Read(ref health.LastSeenUnixMs)
                 };
             }
 
@@ -410,7 +569,18 @@ public sealed class UpstreamRacer
 
             var temp = path + ".tmp";
 
-            File.WriteAllText(temp, JsonSerializer.Serialize(dto));
+            using (var stream = new FileStream(
+                       temp,
+                       FileMode.Create,
+                       FileAccess.Write,
+                       FileShare.None,
+                       bufferSize: 64 * 1024,
+                       FileOptions.WriteThrough))
+            {
+                JsonSerializer.Serialize(stream, dto);
+                stream.Flush(flushToDisk: true);
+            }
+
             File.Move(temp, path, overwrite: true);
         }
         catch (Exception ex)
@@ -435,6 +605,9 @@ public sealed class UpstreamRacer
         public long LastFailureMs { get; set; }
 
         public double EwmaMs { get; set; } = -1;
+
+        /// <summary>最后一次成功或失败的时间；旧版文件里没有这个字段，读出来是 0（按最老处理）。</summary>
+        public long LastSeenMs { get; set; }
     }
 
     /// <summary>

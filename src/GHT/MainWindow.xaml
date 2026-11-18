@@ -170,6 +170,11 @@
                     <TextBlock Text="扫描超时(ms)" VerticalAlignment="Center" />
                     <TextBox x:Name="ScanTimeoutBox" Width="60" Margin="6,0,0,0" />
                 </StackPanel>
+                <StackPanel Orientation="Horizontal" Margin="0,0,18,8">
+                    <TextBlock Text="最大连接数" VerticalAlignment="Center" />
+                    <TextBox x:Name="MaxConnectionsBox" Width="60" Margin="6,0,0,0"
+                             ToolTip="同时处理的客户端连接上限，超出后新连接返回 503。按每连接约 1MB 峰值估算内存上限；0 = 不限" />
+                </StackPanel>
                 <CheckBox x:Name="FallbackCheck" Content="候选全失败时用系统 DNS 兜底"
                           ToolTip="加速池解析出的 IP 全部连不上时，再用系统 DNS 试一次；关闭后直接返回 502"
                           VerticalAlignment="Center" Margin="0,0,18,8" />

@@ -342,8 +342,7 @@ public sealed class ProxyProtocolIntegrationTests
 
     [Fact]
     public async Task Request_to_unreachable_upstream_gets_502()
-    {
-        using var log = new TempLog();
+    {        using var log = new TempLog();
 
         // 拿一个确定没人监听的端口
         var dead = Net.FreePort();
@@ -361,5 +360,82 @@ public sealed class ProxyProtocolIntegrationTests
             var response = await Net.ReadToEndAsync(stream, 15000);
             Assert.Contains("502", response);
         }
+    }
+
+    /// <summary>
+    /// 全局并发上限：占满之后新连接必须收到 503，而不是继续被接入。
+    /// 这条断言对应的是一个真实的内存风险 —— 旧实现对每条连接都无条件起任务，活跃连接没有上界。
+    /// </summary>
+    [Fact]
+    public async Task Connection_over_the_global_limit_gets_503()
+    {
+        using var log = new TempLog();
+
+        var settings = Net.DirectSettings();
+        settings.MaxConcurrentConnections = 1;
+        settings.MaxConnectionsPerHost = 0;
+
+        var port = Net.FreePort();
+        await using var server = new ProxyServer(settings, log.Service, Path.Combine(log.Directory, "health.json"));
+        await server.StartAsync(port);
+
+        // 这条连接什么都不发，停在读请求头上，占住唯一的名额
+        using var busy = new TcpClient();
+        await busy.ConnectAsync(IPAddress.Loopback, port);
+
+        Assert.True(
+            await Net.WaitUntilAsync(() => server.BudgetedConnections == 1),
+            "第一条连接必须被计入并发名额");
+
+        using var rejected = new TcpClient();
+        await rejected.ConnectAsync(IPAddress.Loopback, port);
+
+        // 拒绝发生在接入时，不需要客户端先发请求
+        var response = await Net.ReadUntilAsync(rejected.GetStream(), "\r\n\r\n", 5000);
+
+        Assert.Contains("503", response);
+        Assert.Equal(1, server.RejectedConnections);
+    }
+
+    /// <summary>
+    /// 单主机上限：同一目标占满后，第二条隧道收到 503，而其他目标不受影响。
+    /// </summary>
+    [Fact]
+    public async Task Connection_over_the_per_host_limit_gets_503()
+    {
+        using var log = new TempLog();
+
+        await using var upstream = new FakeUpstream(async (_, token) =>
+            await Task.Delay(Timeout.Infinite, token).ConfigureAwait(false));
+
+        var settings = Net.DirectSettings();
+        settings.MaxConcurrentConnections = 10;
+        settings.MaxConnectionsPerHost = 1;
+
+        var port = Net.FreePort();
+        await using var server = new ProxyServer(settings, log.Service, Path.Combine(log.Directory, "health.json"));
+        await server.StartAsync(port);
+
+        using var first = new TcpClient();
+        await first.ConnectAsync(IPAddress.Loopback, port);
+
+        var firstStream = first.GetStream();
+        await Net.WriteAsciiAsync(
+            firstStream,
+            $"CONNECT 127.0.0.1:{upstream.Port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream.Port}\r\n\r\n");
+
+        var established = await Net.ReadUntilAsync(firstStream, "\r\n\r\n", 5000);
+        Assert.Contains("200", established);
+
+        using var second = new TcpClient();
+        await second.ConnectAsync(IPAddress.Loopback, port);
+
+        var secondStream = second.GetStream();
+        await Net.WriteAsciiAsync(
+            secondStream,
+            $"CONNECT 127.0.0.1:{upstream.Port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream.Port}\r\n\r\n");
+
+        var rejected = await Net.ReadUntilAsync(secondStream, "\r\n\r\n", 5000);
+        Assert.Contains("503", rejected);
     }
 }

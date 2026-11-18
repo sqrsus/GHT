@@ -15,9 +15,9 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <!-- 用正斜杠：本地也会在 WSL/Linux 上用 EnableWindowsTargeting 交叉编译，反斜杠在那里解析不了 -->
     <ApplicationIcon>Resources/app.ico</ApplicationIcon>
-    <Version>1.5.0</Version>
-    <AssemblyVersion>1.5.0.0</AssemblyVersion>
-    <FileVersion>1.5.0.0</FileVersion>
+    <Version>1.6.0</Version>
+    <AssemblyVersion>1.6.0.0</AssemblyVersion>
+    <FileVersion>1.6.0.0</FileVersion>
     <Product>GHT - GitHub 访问加速</Product>
     <Company>GHT</Company>
     <Copyright>Copyright (c) 2026 sqrsus</Copyright>

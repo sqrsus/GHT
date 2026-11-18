@@ -42,6 +42,18 @@ public sealed class ResolverHub
     /// <summary>映射表的软上限。地址集合本身有限，这里只是防止长期运行后无限增长。</summary>
     private const int IpSourceSoftLimit = 8192;
 
+    /// <summary>
+    /// 在飞扫描表的硬上限。正常情况下「扫描完成即移除」已经把它压到与并发域名同阶，
+    /// 这个阈值只是兜底：万一某条路径漏了移除，也不会一路涨到进程结束。
+    /// </summary>
+    private const int MaxTrackedSweeps = 2048;
+
+    /// <summary>单台 DNS 的健康记录上限。池子通常只有几十台，这个阈值只在换池很多次后才可能碰到。</summary>
+    private const int MaxServerHealth = 2048;
+
+    /// <summary>健康记录超过这个时长没有任何活动就被丢弃（换池后旧服务器会自然被淘汰）。</summary>
+    private static readonly long ServerHealthIdleMs = (long)TimeSpan.FromHours(1).TotalMilliseconds;
+
     // ── 健康度权重与半衰期 ──────────────────────────────────────────────
     // 三类负面信号的证据强度完全不同，混成一个计数器就是把「网线被拔」和「DNS 投毒」当成一回事：
     //   投毒（应答全是不可路由地址）：最强的证据，权重 2，半衰期 30 分钟；
@@ -68,10 +80,31 @@ public sealed class ResolverHub
 
     /// <summary>
     /// 在飞的扫描，键是 <c>host#generation</c>。
-    /// 带上版本号是为了让「换池前发起、换池后才返回」的扫描无法被新请求复用。
+    /// 带上版本号是为了让「换池前发起、换池后才发现」的扫描无法被新请求复用。
+    ///
+    /// 生命周期：扫描一结束就把自己这一项移除（见 <see cref="RemoveWhenDoneAsync"/>）。
+    /// 旧实现只在「下一次解析同一个域名」时才顺手清理，于是高频访问大量不同域名时，
+    /// 这张表只增不减 —— 每项都攥着 Task、候选表与首批快照，长跑下来是明确的内存泄漏。
     /// </summary>
-    private readonly ConcurrentDictionary<string, Lazy<Task<IReadOnlyList<IPAddress>>>> _sweeps =
+    private readonly ConcurrentDictionary<string, Lazy<SweepEntry>> _sweeps =
         new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 一次扫描的两个句柄。<see cref="First"/> 给调用方等待，<see cref="Completion"/> 给回收逻辑用：
+    /// 首批发布之后后台补齐还会继续跑，只在首批完成时回收会掐掉缓存补充。
+    /// </summary>
+    private sealed class SweepEntry
+    {
+        public SweepEntry(Task<IReadOnlyList<IPAddress>> first, Task completion)
+        {
+            First = first;
+            Completion = completion;
+        }
+
+        public Task<IReadOnlyList<IPAddress>> First { get; }
+
+        public Task Completion { get; }
+    }
 
     /// <summary>
     /// 每台公共 DNS 在运行期的命中/失败计数。UI 用它在加速池里显示「健康 / 降级 / 失效」，
@@ -81,6 +114,9 @@ public sealed class ResolverHub
     private readonly ConcurrentDictionary<string, ServerHealth> _serverHealth =
         new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>健康表的条目计数。维护它的理由见 <see cref="ServerHealthCount"/>。</summary>
+    private int _serverHealthCount;
+
     /// <summary>
     /// 候选 IP → 首个给出它的那台 DNS。
     ///
@@ -88,8 +124,17 @@ public sealed class ResolverHub
     /// 实测池里有 DNS 对 github.com 返回 127.0.0.1、198.51.44.8 这类地址，它们「答得很积极」，
     /// 于是永远排在首批，而答案永远连不上。有了 IP 到来源的映射，竞速失败时才能把责任
     /// 精确记到那台 DNS 上，而不是笼统地让所有 DNS 一起背锅。
+    ///
+    /// 上限用「先进先出淘汰」而不是 <c>Clear()</c>：整表清空会让紧随其后的失败归因全部丢失
+    /// （那几秒里所有 DNS 都突然「没有责任」），分批淘汰只损失最早的一批。
     /// </summary>
     private readonly ConcurrentDictionary<IPAddress, string> _ipSource = new();
+
+    /// <summary>插入顺序，用于超限时的先进先出淘汰。</summary>
+    private readonly ConcurrentQueue<IPAddress> _ipSourceOrder = new();
+
+    /// <summary>插入计数（近似值，只用于判断「该不该淘汰」，不要求与字典严格一致）。</summary>
+    private int _ipSourceCount;
 
     private volatile IReadOnlyList<DnsPoolEntry> _pool = Array.Empty<DnsPoolEntry>();
 
@@ -125,6 +170,15 @@ public sealed class ResolverHub
     public int PoolCount => _pool.Count;
 
     public int CachedDomainCount => _cache.Count;
+
+    /// <summary>扫描表当前条目数（诊断用）。正常情况下应随时回到 0 附近。</summary>
+    public int TrackedSweepCount => _sweeps.Count;
+
+    /// <summary>DNS 健康记录条目数（诊断用）。用自维护计数：<c>Count</c> 要拿全表的锁，热路径上代价太高。</summary>
+    public int ServerHealthCount => Volatile.Read(ref _serverHealthCount);
+
+    /// <summary>地址到来源的映射条目数（诊断用）。</summary>
+    public int IpSourceCount => Volatile.Read(ref _ipSourceCount);
 
     /// <summary>取某台公共 DNS 的成功/失败次数（从未参与解析时返回 (0,0)）。</summary>
     /// <remarks>「答了但答案连不上」也计入失败，因为对使用者而言它与解析失败没有区别。</remarks>
@@ -163,11 +217,13 @@ public sealed class ResolverHub
             return;
         }
 
-        var health = _serverHealth.GetOrAdd(server, _ => new ServerHealth());
+        var health = GetHealth(server);
         var now = Environment.TickCount64;
 
         lock (health)
         {
+            health.LastTouchMs = now;
+
             switch (kind)
             {
                 case AddressFailureKind.Refused:
@@ -213,6 +269,13 @@ public sealed class ResolverHub
 
         public double FailScore;
         public long FailStamp;
+
+        /// <summary>
+        /// 最后一次被更新的时刻（<see cref="Environment.TickCount64"/>）。
+        /// 只用于淘汰「换池后不再出现的旧服务器」，不参与任何排序：
+        /// 它与各分桶的 stamp 是两个概念，混用会让衰减算错。
+        /// </summary>
+        public long LastTouchMs;
 
         /// <summary>加权负面分（已衰减）。</summary>
         public double NegativeScore(long now) =>
@@ -290,43 +353,54 @@ public sealed class ResolverHub
 
         var generation = Volatile.Read(ref _generation);
         var key = host + "#" + generation.ToString();
-        Task<IReadOnlyList<IPAddress>>? sweep = null;
 
-        if (_sweeps.TryGetValue(key, out var tracked))
+        var lazy = _sweeps.GetOrAdd(key, _ => CreateSweep(host, generation, key));
+        var entry = lazy.Value;
+
+        // 扫描可能在工厂返回之前就结束了（池子为空时是同步收口的）。
+        // 那种情况下字典里留下的是一个已完成的项，这里顺手回收，不必等下一次同域名请求。
+        if (entry.Completion.IsCompleted)
         {
-            if (tracked.Value.IsCompleted)
-            {
-                RemoveSweep(key, tracked);
-            }
-            else
-            {
-                sweep = tracked.Value;
-            }
+            RemoveSweep(key, lazy);
+        }
+        else if (_sweeps.Count > MaxTrackedSweeps)
+        {
+            PruneCompletedSweeps();
         }
 
-        sweep ??= _sweeps.GetOrAdd(key, _ => CreateSweep(host, generation)).Value;
-
-        return await sweep.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return await entry.First.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
     /// 按 key + value 精确移除。并发下另一个调用可能刚把「新任务」放进字典，
     /// 此时 <c>TryRemove(key)</c> 会把新任务删掉，导致短时间内重复启动扫描。
     /// </summary>
-    private void RemoveSweep(string key, Lazy<Task<IReadOnlyList<IPAddress>>> tracked)
+    private void RemoveSweep(string key, Lazy<SweepEntry> tracked)
     {
-        var collection = (ICollection<KeyValuePair<string, Lazy<Task<IReadOnlyList<IPAddress>>>>>)_sweeps;
-        collection.Remove(new KeyValuePair<string, Lazy<Task<IReadOnlyList<IPAddress>>>>(key, tracked));
+        var collection = (ICollection<KeyValuePair<string, Lazy<SweepEntry>>>)_sweeps;
+        collection.Remove(new KeyValuePair<string, Lazy<SweepEntry>>(key, tracked));
+    }
+
+    /// <summary>兜底清理：把已完成但没被移除的项扫出去。只在超过阈值时调用，避免变成每次解析的开销。</summary>
+    private void PruneCompletedSweeps()
+    {
+        foreach (var pair in _sweeps)
+        {
+            if (pair.Value.IsValueCreated && pair.Value.Value.Completion.IsCompleted)
+            {
+                RemoveSweep(pair.Key, pair.Value);
+            }
+        }
     }
 
     /// <summary>
     /// 用 <see cref="Lazy{T}"/> 包一层再放进字典：<c>GetOrAdd</c> 的工厂在高并发下可能被调用多次
     /// （只有一份会被保留），如果工厂本身带「启动扫描」的副作用，那些被丢弃的调用就会白扫一遍。
     /// </summary>
-    private Lazy<Task<IReadOnlyList<IPAddress>>> CreateSweep(string host, int generation) =>
-        new(() => StartSweep(host, generation), LazyThreadSafetyMode.ExecutionAndPublication);
+    private Lazy<SweepEntry> CreateSweep(string host, int generation, string key) =>
+        new(() => StartSweep(host, generation, key), LazyThreadSafetyMode.ExecutionAndPublication);
 
-    private Task<IReadOnlyList<IPAddress>> StartSweep(string host, int generation)
+    private SweepEntry StartSweep(string host, int generation, string key)
     {
         var window = Math.Max(0, _firstBatchMs);
 
@@ -337,9 +411,37 @@ public sealed class ResolverHub
 
         // 直接启动异步方法：首个 await 前只有建 socket 这类极短的同步工作。
         // 旧实现用 Task.Run 包一层，调用方本身在池线程时还要再排一次队，白白推迟首批结果。
-        _ = SweepAsync(context, window);
+        var completion = SweepAsync(context, window);
 
-        return context.FirstBatch;
+        var entry = new SweepEntry(context.FirstBatch, completion);
+        _ = RemoveWhenDoneAsync(key, entry, completion);
+
+        return entry;
+    }
+
+    /// <summary>
+    /// 扫描结束即把自己这一项从字典里摘掉。
+    ///
+    /// 这里先 <c>Task.Yield()</c> 让出一次：扫描可能在 <c>GetOrAdd</c> 的工厂返回之前就同步结束，
+    /// 那种情况下字典里还没有这一项，过早移除会漏掉它（剩下的交给下一次同域名解析与阈值兜底）。
+    /// </summary>
+    private async Task RemoveWhenDoneAsync(string key, SweepEntry entry, Task completion)
+    {
+        try
+        {
+            await completion.ConfigureAwait(false);
+        }
+        catch
+        {
+            // 扫描自身的异常已经在 SweepAsync 里记录过，这里只负责回收
+        }
+
+        await Task.Yield();
+
+        if (_sweeps.TryGetValue(key, out var tracked) && ReferenceEquals(tracked.Value, entry))
+        {
+            RemoveSweep(key, tracked);
+        }
     }
 
     private async Task SweepAsync(SweepContext context, int window)
@@ -636,7 +738,7 @@ public sealed class ResolverHub
     /// <summary>答出了可用地址：累加正向分，让历史失败随时间被冲淡。</summary>
     private void RecordOk(string ip)
     {
-        var health = _serverHealth.GetOrAdd(ip, _ => new ServerHealth());
+        var health = GetHealth(ip);
         var now = Environment.TickCount64;
 
         lock (health)
@@ -644,13 +746,16 @@ public sealed class ResolverHub
             health.OkRaw++;
             health.OkScore = Decay(health.OkScore, health.OkStamp, now, OkHalfLifeMs) + 1;
             health.OkStamp = now;
+            health.LastTouchMs = now;
         }
+
+        MaybePruneHealth();
     }
 
     /// <summary>答不出（超时、传输失败、空答案）：弱证据，衰减最快的那个桶。</summary>
     private void RecordFail(string ip)
     {
-        var health = _serverHealth.GetOrAdd(ip, _ => new ServerHealth());
+        var health = GetHealth(ip);
         var now = Environment.TickCount64;
 
         lock (health)
@@ -658,13 +763,16 @@ public sealed class ResolverHub
             health.FailRaw++;
             health.FailScore = Decay(health.FailScore, health.FailStamp, now, SoftHalfLifeMs) + 1;
             health.FailStamp = now;
+            health.LastTouchMs = now;
         }
+
+        MaybePruneHealth();
     }
 
     /// <summary>答了，但答案全是不可路由地址：强证据（投毒/污染）。</summary>
     private void RecordPoison(string ip)
     {
-        var health = _serverHealth.GetOrAdd(ip, _ => new ServerHealth());
+        var health = GetHealth(ip);
         var now = Environment.TickCount64;
 
         lock (health)
@@ -672,6 +780,124 @@ public sealed class ResolverHub
             health.BadRaw++;
             health.BadScore = Decay(health.BadScore, health.BadStamp, now, PoisonHalfLifeMs) + 1;
             health.BadStamp = now;
+            health.LastTouchMs = now;
+        }
+
+        MaybePruneHealth();
+    }
+
+    private ServerHealth GetHealth(string ip)
+    {
+        if (_serverHealth.TryGetValue(ip, out var existing))
+        {
+            return existing;
+        }
+
+        var fresh = new ServerHealth();
+
+        // TryAdd 而不是 GetOrAdd：只有真的插进去才该计数，
+        // 否则并发下工厂多跑几次就会把计数器抬高，上限判断跟着失真。
+        if (_serverHealth.TryAdd(ip, fresh))
+        {
+            Interlocked.Increment(ref _serverHealthCount);
+            return fresh;
+        }
+
+        return _serverHealth.TryGetValue(ip, out existing) ? existing : fresh;
+    }
+
+    /// <summary>
+    /// 健康表的上限维护。
+    ///
+    /// 这张表原本只增不减：换池之后旧服务器永远留在里面，长跑会积累成「几千台 DNS 的计数」。
+    /// 淘汰分两步：先丢掉一小时没有任何活动（多半是已经不在池里）的，仍然超限再按最久未活动淘汰到 3/4。
+    /// </summary>
+    private void MaybePruneHealth()
+    {
+        if (Volatile.Read(ref _serverHealthCount) <= MaxServerHealth)
+        {
+            return;
+        }
+
+        var now = Environment.TickCount64;
+        var idleBefore = now - ServerHealthIdleMs;
+
+        foreach (var pair in _serverHealth)
+        {
+            long touch;
+
+            lock (pair.Value)
+            {
+                touch = pair.Value.LastTouchMs;
+            }
+
+            if (touch < idleBefore)
+            {
+                RemoveServerHealth(pair);
+            }
+        }
+
+        if (Volatile.Read(ref _serverHealthCount) <= MaxServerHealth)
+        {
+            return;
+        }
+
+        var target = MaxServerHealth - (MaxServerHealth / 4);
+        var overflow = Volatile.Read(ref _serverHealthCount) - target;
+
+        var stale = _serverHealth
+            .Select(pair =>
+            {
+                lock (pair.Value)
+                {
+                    return (Pair: pair, Touch: pair.Value.LastTouchMs);
+                }
+            })
+            .OrderBy(item => item.Touch)
+            .Take(overflow)
+            .ToArray();
+
+        foreach (var item in stale)
+        {
+            RemoveServerHealth(item.Pair);
+        }
+    }
+
+    /// <summary>按 key+value 精确移除，避免并发下把同一台服务器的新计数项误删。</summary>
+    private void RemoveServerHealth(KeyValuePair<string, ServerHealth> pair)
+    {
+        if (((ICollection<KeyValuePair<string, ServerHealth>>)_serverHealth).Remove(pair))
+        {
+            Interlocked.Decrement(ref _serverHealthCount);
+        }
+    }
+
+    /// <summary>
+    /// 记下地址的来源。超过软上限时按插入顺序淘汰四分之一 ——
+    /// 不再整表 <c>Clear()</c>：那会让紧随其后的失败归因全部丢失，看起来像「所有 DNS 突然都没责任」。
+    /// </summary>
+    private void RememberIpSource(IPAddress address, string server)
+    {
+        if (!_ipSource.TryAdd(address, server))
+        {
+            return;
+        }
+
+        _ipSourceOrder.Enqueue(address);
+
+        if (Interlocked.Increment(ref _ipSourceCount) <= IpSourceSoftLimit)
+        {
+            return;
+        }
+
+        var target = IpSourceSoftLimit - (IpSourceSoftLimit / 4);
+
+        while (Volatile.Read(ref _ipSourceCount) > target && _ipSourceOrder.TryDequeue(out var stale))
+        {
+            if (_ipSource.TryRemove(stale, out _))
+            {
+                Interlocked.Decrement(ref _ipSourceCount);
+            }
         }
     }
 
@@ -736,18 +962,13 @@ public sealed class ResolverHub
 
                 _hub._cache.Merge(Host, addresses, ttl, _hub._preferIpv4);
 
-                if (_hub._ipSource.Count >= IpSourceSoftLimit)
-                {
-                    _hub._ipSource.Clear();
-                }
-
                 var added = false;
 
                 foreach (var address in addresses)
                 {
                     // 记录「谁给出了这个地址」，供后续竞速失败时归因。同一地址以首个给出者为准：
                     // 后给出同一答案的 DNS 只是随声附和，不该分享责任。
-                    _hub._ipSource.TryAdd(address, server);
+                    _hub.RememberIpSource(address, server);
 
                     if (_seen.Add(address))
                     {

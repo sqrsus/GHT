@@ -133,6 +133,8 @@ RaceBatchBudgetMs (9000) <  ConnectBudgetMs (12000)      # 否则批预算永远
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `ProxyPort` | `7890` | 本地监听端口，仅绑定 `127.0.0.1` |
+| `MaxConcurrentConnections` | `512` | 同时处理的客户端连接上限，超出后新连接收到 **503**；`0` = 不限。按每连接约 600KB–1MB 峰值估算，512 对应 300–500MB 的量级 |
+| `MaxConnectionsPerHost` | `64` | 同一上游主机的并发隧道上限，防止单个站点吃光全局额度；`0` = 不限。**不按客户端 IP 分组**：本代理只监听回环，所有客户端都是 `127.0.0.1`，那样第二个上限会完全失效 |
 | `GlobalDnsWhitelist` | GitHub 相关 16 条 | 逗号/分号/换行分隔，支持 `*.` 前缀通配；**可清空**，清空即全部走系统 DNS。只接受主机名（字母数字与 `.-_`），误贴的 `https://…`、`host:port`、带路径的条目会被丢弃；最多 256 条 |
 | `DnsAccelEnabled` | `true` | 总开关 |
 | `ConnectBudgetMs` | `12000` | 首连预算；`0` = 不限（等价旧行为，作为回滚开关）。**必须大于 `RaceConnectTimeoutMs`**，否则竞速会在单个地址给出结论前被整体取消 |
@@ -181,7 +183,9 @@ src/GHT/
 └── Services/
     ├── ProxyServer.cs         接入、选路编排、隧道与明文转发
     ├── ProxyProtocol.cs       HTTP 常量、逐跳头规则、错误响应
-    ├── UpstreamRacer.cs       TCP 建连竞速 + 地址健康度（跨进程持久化）
+    ├── ConnectionBudget.cs    并发准入闸门（全局 + 按上游主机，超限 503）
+    ├── RuntimeMetrics.cs      运行期内存/GC/连接/字典规模快照（O(1) 采样）
+    ├── UpstreamRacer.cs       TCP 建连竞速 + 地址健康度（跨进程持久化、条目封顶）
     ├── ResolverHub.cs         域名 → 候选 IP（预算语义、后台扫描、渐进缓存、DNS 健康度）
     ├── Diagnostics/           域名诊断（复用 DNS 扫描与竞速，产出可复制报告）
     ├── Http/                  请求头解析、前置缓冲流、带缓冲的行读取流
@@ -199,7 +203,7 @@ src/GHT/
 tests/GHT.Tests/               单元测试 + 网络边界集成测试（链接源码，可跨平台运行）
 ├── 单元：HttpHead / ChunkedBody / DnsMessage / DnsResultCache / AddressPolicy / ResolverHub
 │         / SweepRace / UpstreamRacer / ProxyStatistics / LogService / SettingsStore
-│         / DomainWildcardList / RuntimeGuard
+│         / DomainWildcardList / RuntimeGuard / MemoryBounds（各表上界与回收）
 └── 集成：ProxyLifecycle / ProxyProtocolIntegration / LogPrivacy（真实 socket + 本机假上游）
 ```
 
@@ -209,7 +213,7 @@ tests/GHT.Tests/               单元测试 + 网络边界集成测试（链接�
 
 | 工作流 | 触发 | 做了什么 |
 |---|---|---|
-| `build.yml` | push / PR 到 `main`、手动 | restore → **依赖漏洞扫描** → build → **dotnet test（183 例）** → publish 单文件 exe → **校验 exe 版本资源与 csproj 一致** → 生成 `SHA256SUMS.txt` → 上传 `GHT-win-x64` artifact |
+| `build.yml` | push / PR 到 `main`、手动 | restore → **依赖漏洞扫描** → build → **dotnet test（199 例）** → publish 单文件 exe → **校验 exe 版本资源与 csproj 一致** → 生成 `SHA256SUMS.txt` → 上传 `GHT-win-x64` artifact |
 | `release.yml` | 推送 `v*` 标签 | **校验标签与程序集版本一致**（不一致直接失败）→ 漏洞扫描 → build → test → publish → 校验版本资源 → 生成 SHA256 → 打包 zip → 创建 Release（附 zip 与 `SHA256SUMS.txt`；若 `docs/release-notes/<tag>.md` 存在就用它作正文，否则自动生成） |
 
 `build.yml` 支持手动触发时勾选「独立部署」：产物改为 `--self-contained true` 并开启压缩，用户无需预装 .NET 桌面运行时；代价是单文件体积显著变大，因此默认仍走框架依赖。
@@ -218,8 +222,8 @@ tests/GHT.Tests/               单元测试 + 网络边界集成测试（链接�
 
 ```bash
 # csproj 里的 <Version> 必须与标签一致，否则 release.yml 第一步就会失败
-git tag v1.5.0
-git push origin v1.5.0
+git tag v1.6.0
+git push origin v1.6.0
 ```
 
 > **关于签名**：仓库里没有可用的代码签名证书，因此产物**未做签名**。作为替代，Release 附带 `SHA256SUMS.txt`，下载后可自行校验（`certutil -hashfile GHT.exe SHA256`）。要做可信发布，需要在 secrets 里配置证书并在发布前用 `signtool` 签名 —— 在没有证书的情况下伪造「签名流程」只会给用户错误的安全感，所以这里明确留空。
@@ -263,13 +267,56 @@ host、池版本、候选表、首批发布状态打包进一个对象，发布�
 
 ---
 
-## 八、已知边界
+## 八、内存与并发上界
+
+单机长期挂着是常态，所以每一项「会长大的东西」都必须有明确上界和确定的回收时机：
+
+| 对象 | 上界 | 回收时机 | 没有上界会怎样 |
+|---|---|---|---|
+| 活跃连接 | `MaxConcurrentConnections` 512 + `MaxConnectionsPerHost` 64 | 处理结束即归还名额 | 每条隧道 600KB–1MB（两个 32KB 转发缓冲 + 两端各 256KB 套接字缓冲 + 任务与状态），无上限时一个失控客户端就能吃掉几个 GB |
+| 在飞扫描表 `_sweeps` | 2048（兜底） | **扫描一结束就按 key+value 精确移除**，不再等下一次同域名请求 | 高频访问大量不同域名时只增不减，每项都攥着 Task、候选表与首批快照 |
+| 域名 → 地址缓存 | 512 条 × 每域名 64 个地址 | TTL 到期逐个剔除；超限时按最早到期淘汰到 3/4（30s 节流） | 一个域名被几十台 DNS 各答一遍，答案会不断累积 |
+| 地址健康度 `_health` | 4096 | 30 天未出现即淘汰；仍超限时按最久未见淘汰到 3/4 | 长期访问大量域名会持续引入新 IP，且每次保存都要整份序列化 |
+| DNS 健康度 `_serverHealth` | 2048 | 1 小时无活动即淘汰；仍超限时按最久未活动淘汰 | 换池之后旧服务器永远留在表里 |
+| 地址 → 来源 `_ipSource` | 8192 | 超限时按插入顺序淘汰 1/4 | 原来是整表 `Clear()`，会让紧随其后的失败归因全部丢失 |
+| 最近日志环形缓冲 | 500 条 **且** 512K 字符 | 入队时按条数 + 字符数双重淘汰 | 只按条数限，最坏是 500 × 4000 字符 = 2MB |
+| 日志写盘队列 | 2048 条 | 满时丢最旧的一条 | 原来 8192 条，最坏是 32MB 量级 |
+
+并发上限有两个刻意的取舍：
+
+- **超限回 503，不静默断开**，但拒绝路径自身也是有界的：只有拿到 16 个拒绝槽位之一时才写响应，拿不到就直接关连接 —— 否则「拒绝」本身会变成新的内存压力源。
+- **单主机上限不按客户端 IP 分组**：本代理只监听回环，所有客户端都是 `127.0.0.1`，按客户端 IP 分组等于让这个上限完全失效。真正的风险源是「同一个上游被并发打满」，所以按目标主机分组。计数归零时条目立即从字典移除，字典规模因此不会随「访问过的域名数」增长。
+
+还有两处是「省分配」而不是「设上限」：缓存排序的地址字节只取一次（不再让比较器在 O(n log n) 次比较里反复 `GetAddressBytes()`），以及「答案全是已知地址且未过期」时只顺延 TTL、不重建数组与排序。
+
+## 运行期观测
+
+状态栏第二行是一组运行期指标（每秒刷新，全部是 O(1) 读数）：
+
+```
+内存 62.4MB · 分配 3.1MB/s · GC 12/3/1 · 连接 14/512（拒绝 0） · 缓存 6 · 扫描 0 · DNS 88 · 地址 120 · 来源 40 · 日志 0 · 线程池排队 0
+```
+
+判读只有一条原则：**跑几小时后，任何一项单调增长都说明有一处没被回收**。「扫描」应随时回到 0 附近；「缓存」「地址」「DNS」应稳定在一个量级而不是持续爬升；「分配」是每秒托管分配量，长期几十 MB/s 说明热路径在某处反复分配。
+
+需要更细的基线时用官方计数器（不侵入进程）：
+
+```bash
+dotnet-counters monitor -n GHT --counters System.Runtime[gc.heap-size,gc.pause-time-percent,gc.alloc-rate,threadpool.queue-length,threadpool.completed-items-count]
+```
+
+采样 1 分钟看趋势而不是绝对值：`gc.heap-size` 呈锯齿但不抬头、`gc.pause-time-percent` 低于 5%、`gc.alloc-rate` 稳定在几 MB/s 属正常；`threadpool.queue-length` 长期不降说明有阻塞调用占住了线程池。
+
+---
+
+## 九、已知边界
 
 - **仅 Windows 10（build 17763）及以上 x64**：WPF + 注册表 + 托盘，跨平台需重写宿主层。启动时 `RuntimeGuard` 会检查系统版本与运行时并在不满足时给出可读提示（而不是崩在某个 P/Invoke 上）。
 - **框架依赖发布需要 .NET 8 桌面运行时**：没装时系统会弹「需要 .NET」，或可改用手动触发的独立部署构建（无需预装，体积明显更大）。
 - **产物未做代码签名**：Release 附 `SHA256SUMS.txt` 供自行校验；可信签名需要证书，仓库里没有。
 - **Windows 专属面没有自动化覆盖**：注册表代理读写、托盘、WPF 生命周期、`SingleInstance` 命名管道只有人工验证路径。自动化的边界明确停在「网络协议层」——集成测试覆盖的是代理与控制连接本身。
 - **停止最多阻塞数秒**：`StopAsync`（以及退出时的 `Cleanup`）会等活跃连接退出，上限 3s + 0.5s 宽限；正常情况连接在取消后毫秒级结束。
+- **并发上限超出即回 503**：`MaxConcurrentConnections`（默认 512）或 `MaxConnectionsPerHost`（默认 64）打满后，新连接直接收到 503，而不是排队等待。这不是「加速失败」——把上限调高只是把内存风险一起调高，正常浏览器打满一个站点也就几十条连接。
 - **仅 HTTP/1.1**：不支持 h2，浏览器会对代理自动降级。
 - **明文 HTTP 采用「一次连接一个请求」**：向上游强制 `Connection: close`，换取转发逻辑的绝对可靠；HTTPS 走隧道不受影响。
 - **明文 HTTP 的帧是严格校验的**：只接受 chunked 与定长两种请求体；畸形头、折行头、重复且冲突的 `Content-Length`、非 chunked 结尾的 `Transfer-Encoding`、缺 CRLF 的分块一律回 400，不做「猜着转发」。
@@ -284,7 +331,7 @@ host、池版本、候选表、首批发布状态打包进一个对象，发布�
 
 ---
 
-## 九、许可与来源
+## 十、许可与来源
 
 本项目以 MIT 许可发布，详见 [LICENSE](LICENSE)。
 
