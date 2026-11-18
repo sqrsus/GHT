@@ -1,0 +1,59 @@
+name: release
+
+# 只有打 v* 标签时才发布（例：git tag v1.0.0 && git push origin v1.0.0）
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 发布 (Windows / .NET 8)
+    runs-on: windows-latest
+
+    env:
+      DOTNET_NOLOGO: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: 发布单文件 exe（框架依赖）
+        run: >
+          dotnet publish src/GHT/GHT.csproj
+          -c Release
+          -r win-x64
+          --self-contained false
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -p:DebugType=None
+          -p:DebugSymbols=false
+          -o dist
+
+      - name: 打包 zip
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist/GHT.exe')) {
+            throw '发布产物中缺少 GHT.exe'
+          }
+          Compress-Archive -Path 'dist/*' -DestinationPath "GHT-${{ github.ref_name }}-win-x64.zip" -Force
+
+      - name: 创建 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "GHT-${{ github.ref_name }}-win-x64.zip" `
+            --title "GHT ${{ github.ref_name }}" `
+            --generate-notes

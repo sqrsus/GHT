@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <!-- 关掉隐式 using：本工程同时启用 WPF 与 WinForms，隐式引入 System.Windows.Forms 会让
+         MessageBox / Application 与 WPF 同名类型二义。基础命名空间改由 GlobalUsings.cs 显式声明。 -->
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>12.0</LangVersion>
+    <AssemblyName>GHT</AssemblyName>
+    <RootNamespace>GHT</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Product>GHT - GitHub 访问加速</Product>
+    <Company>GHT</Company>
+    <Copyright>Copyright (c) 2026 sqrsus</Copyright>
+    <NeutralLanguage>zh-CN</NeutralLanguage>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\public-dns-servers.json">
+      <LogicalName>GHT.Resources.public-dns-servers.json</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,25 @@
+## 构建产物
+[Bb]in/
+[Oo]bj/
+dist/
+publish/
+*.user
+*.suo
+.vs/
+.vscode/
+
+## 打包/临时
+*.zip
+*.log
+TestResults/
+
+## Windows
+Thumbs.db
+desktop.ini
+
+## 本地工作区（不属于交付内容）
+_analysis/
+.workbuddy/
+GHT-开发文档-*.md
+
+## 说明：本仓库不包含任何本地配置或密钥
